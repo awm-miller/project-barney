@@ -1,0 +1,9 @@
+.env
+cookies.txt
+serviceaccount_credentials.json
+.venv/
+__pycache__/
+download_results.csv
+target_dates.txt
+search_results.csv
+unique_institutions.csv
