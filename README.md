@@ -95,23 +95,6 @@ Utility scripts:
 
 The main way to run the full pipeline for a specific set of inputs is using `run_pipeline_single_table.py`.
 
-### Using the HTML Command Generator (Recommended for `run_pipeline_single_table.py`)
-
-A user-friendly way to generate the command for `run_pipeline_single_table.py` is by using the included `pipeline_interface.html` file:
-
-1.  **Open `pipeline_interface.html` in your web browser.**
-2.  Fill in the required fields (Job Name, Channel IDs, Title Query) and any optional parameters for the pipeline run.
-3.  Click the "Generate Command" button.
-4.  The fully constructed command will appear in the text area below the button.
-5.  Copy this command.
-6.  Paste and run it in your terminal from the root directory of the project.
-
-This interface helps prevent errors in typing out the command and its various arguments.
-
-### Manual Command Line Execution for `run_pipeline_single_table.py`
-
-If you prefer, you can construct the command manually:
-
 ```bash
 python run_pipeline_single_table.py \\
     --job-name "my_specific_job" \\
@@ -170,26 +153,28 @@ You can also run individual scripts for specific tasks if needed. Refer to each 
     ```
     *(Note: `export_to_csv.py` uses `--output_csv`, while `run_pipeline_single_table.py` calls it with `--output` which might need adjustment in the orchestrator or the script for consistency.)*
 
-## Web Interface (Command Generator)
-
-This project includes `pipeline_interface.html`, a simple web page that acts as a command generator for the main pipeline script (`run_pipeline_single_table.py`).
-
-**How to Use:**
-
-1.  Open `pipeline_interface.html` directly in your web browser (no web server needed).
-2.  Fill in the form fields corresponding to the arguments for `run_pipeline_single_table.py`:
-    *   Job Name (required)
-    *   Channel IDs (comma-separated, required)
-    *   Title Query (required)
-    *   Download Directory (defaults to `E:\video_downloads`)
-    *   Number of Workers (defaults to 4)
-    *   Max Downloads, Max Transcriptions, Max Summaries (optional)
-3.  Click the "Generate Command" button.
-4.  The complete command-line instruction will be displayed in the text area.
-5.  Copy this command and run it in your terminal from the root directory of the project.
-
-This interface simplifies the process of configuring and starting a pipeline run, reducing the chance of typos in the command-line arguments.
 
 ## Database Management
 
-The `database_manager.py`
+The `database_manager.py` script can be used for various database operations:
+
+-   **Initialize Database (creates all tables and indexes):**
+    ```bash
+    python database_manager.py --initialize
+    ```
+-   **Reset Transcription Statuses (sets all to 'pending'):**
+    ```bash
+    python database_manager.py --reset-transcriptions
+    ```
+    (Other reset/maintenance functions are available within the script but may not have command-line triggers.)
+
+## Key Dependencies
+
+-   `google-api-python-client`: For Google APIs (YouTube, Drive).
+-   `yt-dlp`: For downloading YouTube videos.
+-   `python-dotenv`: For managing environment variables.
+-   `google-cloud-speech` & `google-cloud-storage`: For Google Cloud services.
+-   `google-generativeai`: For the Gemini API.
+
+(See `requirements.txt` for the full list).
+
