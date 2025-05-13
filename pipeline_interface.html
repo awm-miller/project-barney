@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Video Pipeline Command Generator</title>
+    <style>
+        body { font-family: sans-serif; margin: 20px; background-color: #f4f4f4; color: #333; }
+        .container { background-color: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+        h1, h2 { color: #333; }
+        label { display: block; margin-top: 15px; margin-bottom: 5px; font-weight: bold; }
+        input[type="text"], input[type="number"] {
+            width: calc(100% - 22px);
+            padding: 10px;
+            margin-bottom: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            box-sizing: border-box;
+        }
+        button {
+            background-color: #007bff;
+            color: white;
+            padding: 10px 15px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+            margin-top: 20px;
+        }
+        button:hover { background-color: #0056b3; }
+        pre {
+            background-color: #e9e9e9;
+            padding: 15px;
+            border-radius: 4px;
+            overflow-x: auto;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            border: 1px solid #ccc;
+        }
+        code { font-family: monospace; }
+        .note { font-size: 0.9em; color: #555; margin-top: 10px;}
+        .required { color: red; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>YouTube Video Processing Pipeline</h1>
+        <h2>Command Generator for <code>run_pipeline_single_table.py</code></h2>
+
+        <p>This tool helps you generate the command to run the main processing pipeline. Fill in the details below and click "Generate Command".</p>
+        <p class="note">
+            <strong>Important Prerequisites:</strong>
+            <ol>
+                <li>Ensure your <code>.env</code> file is correctly configured with API keys and paths.</li>
+                <li>Install all dependencies: <code>pip install -r requirements.txt</code></li>
+                <li>Initialize the database: <code>python database_manager.py --initialize</code></li>
+                <li>Run the generated command from the root directory of the project in your terminal.</li>
+            </ol>
+        </p>
+
+        <form id="pipelineForm">
+            <label for="jobName">Job Name <span class="required">*</span></label>
+            <input type="text" id="jobName" name="jobName" required placeholder="e.g., new_analysis_job_q1">
+
+            <label for="channels">Channel IDs (comma-separated) <span class="required">*</span></label>
+            <input type="text" id="channels" name="channels" required placeholder="e.g., CHANNEL_ID_1,CHANNEL_ID_2">
+
+            <label for="titleQuery">Title Query <span class="required">*</span></label>
+            <input type="text" id="titleQuery" name="titleQuery" required placeholder="e.g., lecture highlights">
+
+            <label for="downloadDir">Download Directory</label>
+            <input type="text" id="downloadDir" name="downloadDir" value="E:\video_downloads" placeholder="e.g., E:\video_downloads">
+
+            <label for="workers">Number of Workers (for download)</label>
+            <input type="number" id="workers" name="workers" value="4" min="1">
+
+            <label for="maxDownloads">Max Downloads (optional)</label>
+            <input type="number" id="maxDownloads" name="maxDownloads" min="1" placeholder="e.g., 100">
+
+            <label for="maxTranscriptions">Max Transcriptions (optional)</label>
+            <input type="number" id="maxTranscriptions" name="maxTranscriptions" min="1" placeholder="e.g., 50">
+
+            <label for="maxSummaries">Max Summaries (optional)</label>
+            <input type="number" id="maxSummaries" name="maxSummaries" min="1" placeholder="e.g., 25">
+        </form>
+
+        <button onclick="generateCommand()">Generate Command</button>
+
+        <h2>Generated Command:</h2>
+        <pre><code id="outputCommand">Click "Generate Command" above.</code></pre>
+    </div>
+
+    <script>
+        function generateCommand() {
+            const form = document.getElementById('pipelineForm');
+            const jobName = form.elements.jobName.value;
+            const channels = form.elements.channels.value;
+            const titleQuery = form.elements.titleQuery.value;
+            const downloadDir = form.elements.downloadDir.value;
+            const workers = form.elements.workers.value;
+            const maxDownloads = form.elements.maxDownloads.value;
+            const maxTranscriptions = form.elements.maxTranscriptions.value;
+            const maxSummaries = form.elements.maxSummaries.value;
+
+            if (!jobName || !channels || !titleQuery) {
+                document.getElementById('outputCommand').textContent = "Please fill in all required fields (Job Name, Channel IDs, Title Query).";
+                return;
+            }
+
+            let commandParts = [`python run_pipeline_single_table.py`];
+
+            commandParts.push(`--job-name "${jobName}"`);
+            commandParts.push(`--channels "${channels}"`);
+            commandParts.push(`--title-query "${titleQuery}"`);
+            commandParts.push(`--download-dir "${downloadDir}"`); // Default is now E:\video_downloads from input value
+            commandParts.push(`--workers ${workers || '4'}`);
+
+            if (maxDownloads) {
+                commandParts.push(`--max-downloads ${maxDownloads}`);
+            }
+            if (maxTranscriptions) {
+                commandParts.push(`--max-transcriptions ${maxTranscriptions}`);
+            }
+            if (maxSummaries) {
+                commandParts.push(`--max-summaries ${maxSummaries}`);
+            }
+            
+            document.getElementById('outputCommand').textContent = commandParts.join(' \
+    ');
+        }
+    </script>
+</body>
+</html> 

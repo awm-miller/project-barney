@@ -1,445 +1,374 @@
 import os
-import csv
 import logging
 import argparse
 import random
 import time
-from datetime import datetime, timedelta
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
+import json
+import sqlite3
+from datetime import datetime
 from dotenv import load_dotenv
 import yt_dlp
+import concurrent.futures
+
+# Import from our database manager
+from database_manager import create_connection, DATABASE_NAME
 
 # --- Configuration ---
 load_dotenv()
-YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
-if not YOUTUBE_API_KEY:
-    raise ValueError("YOUTUBE_API_KEY not found in .env file or environment variables.")
 
-# Get required download directory from environment variable
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR")
 if not DOWNLOAD_DIR:
-    raise ValueError("DOWNLOAD_DIR not found in .env file or environment variables. Please set it to your desired video download path.")
+    raise ValueError("DOWNLOAD_DIR not found in .env file. Please set it to your desired video download path.")
 
-YOUTUBE_API_SERVICE_NAME = "youtube"
-YOUTUBE_API_VERSION = "v3"
-
-DEFAULT_SEARCH_CSV = "search_results.csv"
-DEFAULT_DATES_FILE = "target_dates.txt"
-DEFAULT_OUTPUT_CSV = "download_results.csv"
 LOG_FILE = "download_videos.log"
+SCRIPT_NAME = "download_videos.py"
 
 # --- Logging Setup ---
 logging.basicConfig(
-    level=logging.INFO,  # Changed back to INFO from DEBUG
+    level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(LOG_FILE),
+        logging.FileHandler(LOG_FILE, encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
 
+# --- Database Helper Functions ---
+
+def get_videos_to_download_from_db(conn, limit=None):
+    """
+    Fetches videos from the database that have not been successfully downloaded.
+    Joins with channels to get institution_name for filename/logging.
+    Orders by published_at in descending order to prioritize recent videos.
+    """
+    cursor = conn.cursor()
+    # Select videos whose download status is not 'completed' (includes pending, failed, NEW, NULL, etc.)
+    sql = f"""
+    SELECT
+        v.id as video_db_id,
+        v.video_id as youtube_video_id,
+        v.video_url,
+        v.title as video_title,
+        v.download_status,
+        c.institution_name,
+        c.channel_title
+    FROM videos v
+    LEFT JOIN channels c ON v.channel_id = c.channel_id
+    WHERE v.download_status IS NULL OR v.download_status != 'completed'
+    ORDER BY v.published_at DESC, v.added_at ASC
+    """
+    params = []
+    if limit:
+        sql += " LIMIT ?"
+        params.append(limit)
+    
+    try:
+        cursor.execute(sql, params)
+        videos_data = cursor.fetchall()
+        logging.info(f"Found {len(videos_data)} videos not marked as 'completed' to process from database.")
+        return [dict(zip([column[0] for column in cursor.description], row)) for row in videos_data]
+    except sqlite3.Error as e:
+        logging.error(f"Database error fetching videos to download: {e}")
+        return []
+
+def update_video_download_details_db(conn, video_db_pk, status_str, download_path_str=None, error_msg_str=None):
+    """Updates video download status, path, errors, and timestamps."""
+    sql = """
+    UPDATE videos
+    SET download_status = ?,
+        download_path = ?,
+        download_error_message = ?,
+        download_initiated_at = COALESCE(download_initiated_at, CASE WHEN ? IN ('downloading', 'completed', 'failed') THEN CURRENT_TIMESTAMP ELSE NULL END),
+        download_completed_at = CASE WHEN ? = 'completed' THEN CURRENT_TIMESTAMP ELSE download_completed_at END,
+        last_updated_at = CURRENT_TIMESTAMP
+    WHERE id = ?;
+    """
+    try:
+        cursor = conn.cursor()
+        cursor.execute(sql, (status_str, download_path_str, error_msg_str, status_str, status_str, video_db_pk))
+        conn.commit()
+        logging.info(f"Updated video (DB ID: {video_db_pk}) to download_status: '{status_str}'.")
+    except sqlite3.Error as e:
+        logging.error(f"Database error updating video (DB ID: {video_db_pk}) download details: {e}")
+
+def add_processing_log_db(conn, video_db_pk, stage_str, status_str, message_str, details_dict=None):
+    """Adds an entry to the processing_logs table."""
+    details_json_str = json.dumps(details_dict) if details_dict else None
+    sql = """
+    INSERT INTO processing_logs (video_record_id, stage, status, message, details, timestamp, source_script)
+    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?);
+    """
+    try:
+        cursor = conn.cursor()
+        if video_db_pk is not None:
+             cursor.execute(sql, (video_db_pk, stage_str, status_str, message_str, details_json_str, SCRIPT_NAME))
+             conn.commit()
+             logging.debug(f"Logged to processing_logs for video_record_id {video_db_pk}: {stage_str} - {status_str}")
+        else:
+            logging.warning(f"Skipped logging to processing_logs due to null video_record_id. Message: {message_str}")
+    except sqlite3.Error as e:
+        logging.error(f"Database error adding processing log for video_record_id {video_db_pk}: {e}")
+
 # --- Helper Functions ---
-def initialize_youtube_api():
-    """Initializes and returns the YouTube Data API client."""
-    start_time = time.time()
-    api_client = build(YOUTUBE_API_SERVICE_NAME, YOUTUBE_API_VERSION, developerKey=YOUTUBE_API_KEY)
-    elapsed = time.time() - start_time
-    logging.info(f"YouTube API initialized in {elapsed:.2f} seconds")
-    return api_client
-
-
 def sanitize_filename(name: str) -> str:
-    """Sanitize string to be safe for filenames."""
-    # Replace invalid characters with '_'
-    return "".join(c if c.isalnum() or c in ' ._-' else '_' for c in name).strip()
+    if name is None:
+        return ""
+    name = name.replace(':', '_').replace('/', '_').replace('\\\\', '_').replace('?', '_').replace('*', '_')
+    name = "".join(c if c.isalnum() or c in ' ._-()[]' else '_' for c in name).strip()
+    return name[:150]
 
-
-def find_closest_video(youtube, channel_id: str, target_date_str: str, window_days: int = 7):
+def download_video(video_db_id: int, yt_video_id: str, video_url: str, video_title: str | None, institution_name: str | None, current_download_dir: str):
     """
-    Finds the video published closest to target_date within a fixed window for the given channel.
-    Returns (video_id, video_title, published_at) or (None, None, error_msg).
+    Downloads a single video using yt-dlp.
+    Returns a dictionary with download results.
     """
     start_time = time.time()
-    logging.info(f"Searching for video near {target_date_str} (±{window_days} days) for channel {channel_id}")
+    current_institution_name_safe = sanitize_filename(institution_name if institution_name else "Unknown_Institution")
+    video_title_safe = sanitize_filename(video_title if video_title else "Untitled_Video")
+    fname_base = f"{current_institution_name_safe}_{video_title_safe}_{yt_video_id}"
+    fname = f"{fname_base}.mp4"
+    out_path = os.path.join(current_download_dir, fname)
+    os.makedirs(current_download_dir, exist_ok=True)
+    log_video_title = video_title if video_title else yt_video_id
+    # Logging of initiation will be handled by the main thread before submitting to pool
+    # logging.info(f"Starting download for video {yt_video_id} ('{log_video_title}') to {out_path}")
 
-    try:
-        target_date = datetime.strptime(target_date_str, "%Y-%m-%d")
-    except ValueError as e:
-        return None, None, f"Invalid date format: {target_date_str}"
-
-    # Define the fixed search window
-    window_before = (target_date - timedelta(days=window_days)).isoformat() + 'Z'
-    window_after = (target_date + timedelta(days=window_days)).isoformat() + 'Z'
-
-    try:
-        search_response = youtube.search().list(
-            channelId=channel_id,
-            part="snippet",
-            type="video",
-            order="date",
-            publishedAfter=window_before,
-            publishedBefore=window_after,
-            maxResults=50
-        ).execute()
-    except HttpError as e:
-        elapsed = time.time() - start_time
-        logging.error(f"HTTP error fetching videos for channel {channel_id} near {target_date_str}: {e} ({elapsed:.2f}s)")
-
-        # Handle quota errors with clear message and immediate return
-        error_content = str(e).lower()
-        if "quota" in error_content or "quotaexceeded" in error_content:
-            logging.critical("YouTube API QUOTA EXCEEDED during search.")
-            return None, None, "API QUOTA EXCEEDED"
-
-        return None, None, f"API Error: {e.status_code}"
-    except Exception as e:
-        elapsed = time.time() - start_time
-        logging.error(f"Unexpected error fetching videos for channel {channel_id} near {target_date_str}: {e} ({elapsed:.2f}s)")
-        return None, None, str(e)
-
-    items = search_response.get("items", [])
-    if items:
-        # Found videos, find the closest one
-        closest = None
-        min_diff = None
-        for item in items:
-            pub_str = item["snippet"]["publishedAt"]
-            pub_date = datetime.fromisoformat(pub_str.rstrip('Z'))
-            diff = abs((pub_date - target_date).days)
-            if min_diff is None or diff < min_diff:
-                min_diff = diff
-                closest = (item["id"]["videoId"], item["snippet"]["title"], pub_str)
-
-        video_id, video_title, published_at = closest
-        elapsed = time.time() - start_time
-        days_from_target = min_diff if min_diff is not None else "unknown"
-        logging.info(f"Found video {video_id} (published {published_at}, {days_from_target} days from target) in {elapsed:.2f}s")
-        return video_id, video_title, published_at
-    else:
-        # No videos found in the fixed window
-        elapsed = time.time() - start_time
-        logging.warning(f"No videos found for channel {channel_id} within ±{window_days} days of {target_date_str} ({elapsed:.2f}s)")
-        return None, None, f"No videos found within ±{window_days} days"
-
-
-def download_video(video_id: str, institution: str, target_date: str, download_dir: str):
-    """Downloads the YouTube video and returns the file path or error message."""
-    start_time = time.time()
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    inst_safe = sanitize_filename(institution.replace(' ', '_'))
-    fname = f"{inst_safe}_{target_date}_{video_id}.mp4"
-    out_path = os.path.join(download_dir, fname)
-
-    os.makedirs(download_dir, exist_ok=True)
-    logging.info(f"Starting download for video {video_id}")
+    result = {
+        "video_db_id": video_db_id,
+        "yt_video_id": yt_video_id,
+        "success": False,
+        "file_path": None,
+        "error_message": None,
+        "video_title": video_title # For logging upon completion
+    }
 
     ydl_opts = {
         'outtmpl': out_path,
-        'quiet': False,  # Show output
-        'noprogress': False,  # Show progress bar
-        'format': 'best[height<=720]'  # Limit to 720p to speed up downloads
+        'quiet': True, # Quieter for parallel execution, detailed logs from main thread
+        'noprogress': True, # No progress bars from yt-dlp itself
+        'format': 'bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4][height<=720]/best',
+        'retries': 2, # Fewer retries in worker, can be retried by main script logic if status remains 'failed'
+        'fragment_retries': 2,
+        'socket_timeout': 60,
+        'verbose': False,
+        'enable_word_time_offsets': True, # Ensure this is True to get word timestamps
     }
-
     try:
+        # logging.debug(f"[Worker {yt_video_id}] Starting yt-dlp download to {out_path}")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-        elapsed = time.time() - start_time
-        logging.info(f"Downloaded video {video_id} in {elapsed:.2f}s")
-        return out_path, None
-    except Exception as e:
-        elapsed = time.time() - start_time
-        logging.error(f"Failed to download video {video_id}: {e} ({elapsed:.2f}s)")
-        return None, str(e)
+            ydl.download([video_url])
+        # logging.debug(f"[Worker {yt_video_id}] yt-dlp download call finished.")
+        
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            # logging.info(f"[Worker {yt_video_id}] Downloaded successfully to {out_path}")
+            result["success"] = True
+            result["file_path"] = out_path
+        else:
+            # logging.error(f"[Worker {yt_video_id}] File not found/empty: {out_path}")
+            result["error_message"] = "File not found or empty after download attempt"
 
+    except yt_dlp.utils.DownloadError as e:
+        # logging.error(f"[Worker {yt_video_id}] yt-dlp DownloadError: {e}")
+        error_message = str(e)[:250]
+        if "Video unavailable" in str(e): error_message = "Video unavailable"
+        elif "Private video" in str(e): error_message = "Private video"
+        elif "HTTP Error 403" in str(e) or "Access denied" in str(e): error_message = "Access denied/Forbidden (403)"
+        elif "Premiere will begin" in str(e): error_message = "Video is a premiere, not yet available"
+        elif "live event will begin" in str(e): error_message = "Video is a live event, not yet available"
+        result["error_message"] = error_message
+    except Exception as e:
+        # logging.error(f"[Worker {yt_video_id}] Generic download exception: {e}")
+        result["error_message"] = str(e)[:250]
+    
+    # elapsed_time = time.time() - start_time
+    # logging.debug(f"[Worker {yt_video_id}] download_video function finished in {elapsed_time:.2f}s. Success: {result['success']}")
+    return result
 
 def format_time_delta(seconds):
-    """Format seconds into a readable time format (HH:MM:SS)"""
     hours, remainder = divmod(int(seconds), 3600)
-    minutes, seconds = divmod(remainder, 60)
-    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-
+    minutes, seconds_val = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds_val:02d}"
 
 # --- Main Execution ---
-def main(search_csv, dates_file, download_dir, output_csv):
+def main(effective_download_dir: str, download_limit: int | None, statuses_to_process: list[str], max_workers: int):
     total_start_time = time.time()
-    start_datetime = datetime.now()
-    logging.info(f"--- Starting Download Videos Script at {start_datetime.strftime('%Y-%m-%d %H:%M:%S')} ---")
-    logging.info(f"Search strategy: Find FIRST video within ±7 days of ONE of the target dates.")
+    logging.info(f"--- Starting Bulk Video Download Script (Parallel Rolling) at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
+    logging.info(f"Videos will be downloaded to: {effective_download_dir}")
+    logging.info(f"Processing videos not marked as 'completed'.")
+    logging.info(f"Using a maximum of {max_workers} parallel workers (rolling submission).")
+    if download_limit:
+        logging.info(f"Will attempt to process at most {download_limit} videos this run.")
 
-    # Load search results
-    start_time = time.time()
-    try:
-        with open(search_csv, 'r', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
-            search_results = [row for row in reader]
-        elapsed = time.time() - start_time
-        logging.info(f"Loaded {len(search_results)} search results in {elapsed:.2f}s")
-    except Exception as e:
-        logging.error(f"Error reading search results CSV '{search_csv}': {e}")
+    conn = create_connection(DATABASE_NAME)
+    if not conn:
+        logging.error("Could not connect to the database. Exiting.")
         return
 
-    # Load dates
-    start_time = time.time()
-    try:
-        with open(dates_file, 'r', encoding='utf-8') as f:
-            dates_list = [line.strip() for line in f if line.strip()]
-        elapsed = time.time() - start_time
-        logging.info(f"Loaded {len(dates_list)} target dates in {elapsed:.2f}s")
-        if not dates_list:
-             logging.error("No target dates found in dates file. Exiting.")
-             return
-    except Exception as e:
-        logging.error(f"Error reading dates file '{dates_file}': {e}")
+    videos_to_process_list = get_videos_to_download_from_db(conn, limit=download_limit)
+
+    if not videos_to_process_list:
+        logging.info("No videos found in database needing download. Exiting.")
+        if conn: conn.close()
         return
 
-    youtube = initialize_youtube_api()
+    total_videos_to_attempt = len(videos_to_process_list)
+    videos_processed_count = 0
+    videos_downloaded_this_run = 0
+    videos_failed_this_run = 0
 
-    # Define new output structure (one video per institution max)
-    fieldnames = [
-        "INSTITUTION",
-        "CHANNEL_ID",
-        "TARGET_DATE_USED",
-        "VIDEO_ID",
-        "PUBLISHED_AT",
-        "VIDEO_PATH",
-        "DAYS_DIFFERENCE",
-        "STATUS", # e.g., "DOWNLOADED", "NO_VIDEO_FOUND", "DOWNLOAD_ERROR", "API_QUOTA_EXCEEDED", "NO_CHANNEL_ID"
-        "ERROR_DETAIL"
-    ]
-    results = []
+    video_iterator = iter(videos_to_process_list) # To pull videos one by one
 
-    # Track progress
-    processed_institutions = 0
-    total_institutions = len(search_results)
-
-    # Track institutions without videos found
-    institutions_without_videos = []
-
-    for i, row in enumerate(search_results):
-        inst_start_time = time.time()
-        institution = row.get("INSTITUTION")
-        channel_id = row.get("CHANNEL_ID")
-        logging.info(f"--- Processing [{i+1}/{total_institutions}] {institution} ({channel_id or 'No Channel ID'}) ---")
-
-        out_row = { # Initialize with default/failure values
-            "INSTITUTION": institution,
-            "CHANNEL_ID": channel_id,
-            "TARGET_DATE_USED": None,
-            "VIDEO_ID": None,
-            "PUBLISHED_AT": None,
-            "VIDEO_PATH": None,
-            "DAYS_DIFFERENCE": None,
-            "STATUS": "PENDING",
-            "ERROR_DETAIL": None
-        }
-
-        if not channel_id:
-            logging.warning(f"Skipping '{institution}' as no channel ID found.")
-            out_row["STATUS"] = "NO_CHANNEL_ID"
-            out_row["ERROR_DETAIL"] = "Channel ID missing in search results CSV"
-            results.append(out_row)
-            institutions_without_videos.append({
-                "institution": institution,
-                "channel_id": channel_id,
-                "reason": "No channel ID found",
-                "dates_tried": []
-            })
-            processed_institutions += 1
-            continue
-
-        # Randomly select up to 3 dates and shuffle their order
-        num_dates_to_try = min(3, len(dates_list))
-        selected_dates = random.sample(dates_list, num_dates_to_try)
-        random.shuffle(selected_dates) # Shuffle the selected dates
-
-        logging.info(f"Trying up to {num_dates_to_try} dates (random order): {selected_dates}")
-
-        found_video_for_inst = False
-        api_quota_hit = False
-        dates_tried_info = []
-
-        for date_str in selected_dates:
-            date_start_time = time.time()
-            logging.info(f"Attempting date: {date_str}")
-            vid_id, vid_title, vid_pubdate = find_closest_video(youtube, channel_id, date_str) # Using modified function (window_days=7 default)
-
-            if vid_id:
-                logging.info(f"Success! Found video {vid_id} for date {date_str}.")
-                found_video_for_inst = True
-
-                # Calculate days difference
-                try:
-                    target_dt = datetime.strptime(date_str, "%Y-%m-%d")
-                    pub_dt = datetime.fromisoformat(vid_pubdate.rstrip('Z'))
-                    days_diff = abs((pub_dt - target_dt).days)
-                except Exception:
-                    days_diff = None # Should not happen if vid_pubdate is valid
-
-                # Attempt download
-                video_path, download_err = download_video(vid_id, institution, date_str, download_dir)
-
-                # Update output row for success
-                out_row["TARGET_DATE_USED"] = date_str
-                out_row["VIDEO_ID"] = vid_id
-                out_row["PUBLISHED_AT"] = vid_pubdate
-                out_row["VIDEO_PATH"] = video_path
-                out_row["DAYS_DIFFERENCE"] = days_diff
-                if download_err:
-                    out_row["STATUS"] = "DOWNLOAD_ERROR"
-                    out_row["ERROR_DETAIL"] = download_err
-                    logging.error(f"Download failed for {vid_id}: {download_err}")
-                else:
-                    out_row["STATUS"] = "DOWNLOADED"
-                    logging.info(f"Video {vid_id} downloaded successfully to {video_path}")
-
-                dates_tried_info.append({"date": date_str, "result": "FOUND_AND_DOWNLOADED" if not download_err else "FOUND_DOWNLOAD_ERROR", "video_id": vid_id, "error": download_err})
-                date_elapsed = time.time() - date_start_time
-                logging.info(f"Processed date {date_str} in {date_elapsed:.2f}s (Found video, stopping search for this institution).")
-                break # Stop trying dates for this institution once one is found and processed
-
-            else:
-                # Video not found for this date, record the reason (error message from find_closest_video)
-                error_msg = vid_pubdate # Error message is returned in the pubdate slot
-                logging.warning(f"No video found for date {date_str}. Reason: {error_msg}")
-                dates_tried_info.append({"date": date_str, "result": "NOT_FOUND", "video_id": None, "error": error_msg})
-
-                if error_msg == "API QUOTA EXCEEDED":
-                    api_quota_hit = True
-                    out_row["STATUS"] = "API_QUOTA_EXCEEDED"
-                    out_row["ERROR_DETAIL"] = "API quota exceeded during video search."
-                    logging.critical("API Quota Exceeded. Halting search for this institution.")
-                    break # Stop trying dates if quota hit
-
-                # Small delay before next API call if we didn't find a video
-                time.sleep(0.5)
-
-            date_elapsed = time.time() - date_start_time
-            logging.info(f"Processed date {date_str} in {date_elapsed:.2f}s (No video found).")
-
-
-        # After trying all selected dates for the institution
-        if not found_video_for_inst:
-            if not api_quota_hit:
-                logging.warning(f"No video found for {institution} after trying dates: {selected_dates}")
-                out_row["STATUS"] = "NO_VIDEO_FOUND"
-                out_row["ERROR_DETAIL"] = f"No video found within ±7 days for tried dates: {selected_dates}"
-            # (If quota hit, status is already set)
-
-            institutions_without_videos.append({
-                "institution": institution,
-                "channel_id": channel_id,
-                "reason": "API Quota Exceeded" if api_quota_hit else "No videos found",
-                "dates_tried": dates_tried_info
-            })
-
-
-        results.append(out_row)
-        processed_institutions += 1
-        inst_elapsed = time.time() - inst_start_time
-        logging.info(f"Completed institution {institution} in {inst_elapsed:.2f}s. Status: {out_row['STATUS']}")
-
-        # Update progress (simpler version without time estimate)
-        if processed_institutions > 0:
-            percent_complete = (processed_institutions / total_institutions) * 100
-            if processed_institutions % 10 == 0 or processed_institutions == total_institutions: # Update every 10 or at the end
-                elapsed_so_far = time.time() - total_start_time
-                logging.info(f"Progress: {processed_institutions}/{total_institutions} ({percent_complete:.1f}%) institutions processed. Elapsed time: {format_time_delta(elapsed_so_far)}")
-
-        # Optional: Add a slightly longer delay between institutions if needed
-        # time.sleep(1.0)
-
-
-    # Write output CSV
-    start_time = time.time()
     try:
-        with open(output_csv, 'w', newline='', encoding='utf-8') as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(results)
-        elapsed = time.time() - start_time
-        logging.info(f"Wrote results to '{output_csv}' in {elapsed:.2f}s")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            active_futures = set()
+
+            while True:
+                # Phase 1: Submit new tasks if there's capacity and videos are available
+                while len(active_futures) < max_workers:
+                    try:
+                        video_data = next(video_iterator)
+                    except StopIteration:
+                        # No more videos to submit
+                        video_data = None 
+                        break # Break from submission loop, continue to process active futures
+                    
+                    # --- Pre-submission processing for this video_data ---
+                    video_db_id = video_data['video_db_id']
+                    yt_video_id = video_data['youtube_video_id']
+                    video_url = video_data['video_url']
+                    video_title = video_data['video_title']
+                    institution_name = video_data.get('institution_name')
+                    current_db_status = video_data['download_status']
+
+                    log_details_initial = {
+                        "youtube_video_id": yt_video_id,
+                        "video_title": video_title,
+                        "current_db_download_status": current_db_status,
+                        "institution_name": institution_name
+                    }
+
+                    if current_db_status == 'completed':
+                        logging.info(f"[Main] Video {yt_video_id} (DB ID: {video_db_id}) already marked 'completed'. Skipping submission.")
+                        videos_processed_count += 1 
+                        continue # To next video in iterator if available
+                    # Removed the elif block that skipped 'downloading' status
+                    # Now, videos in 'downloading' state will proceed to the download attempt.
+                    # You might want to add a log message here if you still want to know it was in 'downloading' state, for example:
+                    # elif current_db_status == 'downloading':
+                    #     logging.warning(f"[Main] Video {yt_video_id} (DB ID: {video_db_id}) found in 'downloading' state. Attempting download anyway.")
+                    
+                    logging.info(f"[Main] Submitting download for video {yt_video_id} (DB ID: {video_db_id}, Title: '{video_title if video_title else 'N/A'}')")
+                    update_video_download_details_db(conn, video_db_id, 'downloading')
+                    add_processing_log_db(conn, video_db_id, 'download', 'submission_to_pool', f"Submitted video {yt_video_id} to download worker pool", log_details_initial)
+                    
+                    future = executor.submit(download_video, 
+                                             video_db_id, yt_video_id, video_url, 
+                                             video_title, institution_name, effective_download_dir)
+                    active_futures.add(future)
+                    # --- End pre-submission processing ---
+                
+                if not active_futures:
+                    # No more videos to submit (video_data is None) and no active tasks left
+                    break # Break from the main while True loop
+
+                # Phase 2: Wait for at least one task to complete and process it
+                done, active_futures_after_wait = concurrent.futures.wait(active_futures, return_when=concurrent.futures.FIRST_COMPLETED)
+                active_futures = active_futures_after_wait # Update active_futures with those still running
+
+                for future in done:
+                    try:
+                        download_result = future.result()
+                        video_db_id_res = download_result["video_db_id"]
+                        yt_video_id_res = download_result["yt_video_id"]
+                        video_title_res = download_result["video_title"]
+                        
+                        log_details_completion = {
+                            "youtube_video_id": yt_video_id_res,
+                            "video_title": video_title_res,
+                            "final_status": 'completed' if download_result["success"] else 'failed'
+                        }
+
+                        if download_result["success"]:
+                            update_video_download_details_db(conn, video_db_id_res, 'completed', download_path_str=download_result["file_path"])
+                            add_processing_log_db(conn, video_db_id_res, 'download', 'completed', f"Successfully downloaded: {download_result['file_path']}", log_details_completion)
+                            videos_downloaded_this_run += 1
+                            logging.info(f"[Main] Download SUCCESS for video {yt_video_id_res} (DB ID: {video_db_id_res}). Path: {download_result['file_path']}")
+                        else:
+                            update_video_download_details_db(conn, video_db_id_res, 'failed', error_msg_str=download_result["error_message"])
+                            add_processing_log_db(conn, video_db_id_res, 'download', 'failed', f"Download error: {download_result['error_message']}", log_details_completion)
+                            videos_failed_this_run += 1
+                            logging.error(f"[Main] Download FAILED for video {yt_video_id_res} (DB ID: {video_db_id_res}). Error: {download_result['error_message']}")
+                    
+                    except Exception as exc:
+                        # This section is for errors in future.result() or the processing logic itself,
+                        # not for download errors caught by download_video function.
+                        logging.error(f"[Main] An unexpected error occurred processing a download result: {exc}. Video task may not be identifiable here if future.result() failed early.")
+                        videos_failed_this_run += 1 
+                    finally:
+                        videos_processed_count += 1
+                
+                # Report progress after processing completed futures
+                if videos_processed_count > 0:
+                    current_elapsed_time = time.time() - total_start_time
+                    logging.info(f"[Main] Progress: {videos_processed_count}/{total_videos_to_attempt} tasks initiated/completed. Successful: {videos_downloaded_this_run}, Failed: {videos_failed_this_run}. Elapsed: {format_time_delta(current_elapsed_time)}.")
+            
+            logging.info("[Main] All video processing attempts concluded.")
+
+    except KeyboardInterrupt:
+        logging.warning("--- Script interrupted by user (Ctrl+C). Workers may take a moment to clean up. ---")
     except Exception as e:
-        logging.error(f"Error writing download results CSV '{output_csv}': {e}")
+        logging.critical(f"--- An unexpected critical error occurred in the main processing loop: {e} ---", exc_info=True)
+    finally:
+        if conn:
+            conn.close()
+            logging.info("Database connection closed.")
 
-    # Write missing videos summary to a file
-    if institutions_without_videos:
-        missing_output_filename = f"missing_videos_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-        try:
-            with open(missing_output_filename, 'w', encoding='utf-8') as f:
-                f.write(f"--- Institutions Without Downloaded Videos ({len(institutions_without_videos)}) ---\n")
-                f.write(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"Search CSV: {search_csv}\n")
-                f.write(f"Dates File: {dates_file}\n")
-                f.write(f"Download Dir: {download_dir}\n")
-                f.write(f"Output CSV: {output_csv}\n\n")
-
-                for entry in institutions_without_videos:
-                    f.write(f"Institution: {entry['institution']} (Channel: {entry['channel_id'] or 'N/A'})\n")
-                    f.write(f"  Reason: {entry['reason']}\n")
-                    if entry['dates_tried']:
-                        f.write("  Dates Tried:\n")
-                        for attempt in entry['dates_tried']:
-                             error_info = f", Error: {attempt['error']}" if attempt['error'] else ""
-                             f.write(f"    - {attempt['date']}: {attempt['result']}{error_info}\n")
-                    f.write("-" * 20 + "\n")
-            logging.info(f"Wrote missing videos report to '{missing_output_filename}'")
-        except Exception as e:
-            logging.error(f"Error writing missing videos report: {e}")
-
-    total_elapsed = time.time() - total_start_time
-    end_datetime = datetime.now()
-
-    # Final Summary Logging
-    logging.info(f"--- Script Complete ---")
-    logging.info(f"Started: {start_datetime.strftime('%Y-%m-%d %H:%M:%S')}")
-    logging.info(f"Ended:   {end_datetime.strftime('%Y-%m-%d %H:%M:%S')}")
-    logging.info(f"Total Runtime: {format_time_delta(total_elapsed)} ({total_elapsed:.2f} seconds)")
-
-    # Summarize results from the 'results' list
-    downloaded_count = sum(1 for r in results if r["STATUS"] == "DOWNLOADED")
-    no_channel_count = sum(1 for r in results if r["STATUS"] == "NO_CHANNEL_ID")
-    no_video_count = sum(1 for r in results if r["STATUS"] == "NO_VIDEO_FOUND")
-    download_error_count = sum(1 for r in results if r["STATUS"] == "DOWNLOAD_ERROR")
-    quota_error_count = sum(1 for r in results if r["STATUS"] == "API_QUOTA_EXCEEDED")
-
-    logging.info(f"--- Results Summary ---")
-    logging.info(f"Total Institutions Processed: {total_institutions}")
-    logging.info(f"  Successfully Downloaded: {downloaded_count}")
-    logging.info(f"  No Channel ID Found:     {no_channel_count}")
-    logging.info(f"  No Video Found (±7d):    {no_video_count}")
-    logging.info(f"  Download Errors:         {download_error_count}")
-    logging.info(f"  API Quota Exceeded:      {quota_error_count}")
-
-    if institutions_without_videos:
-        logging.warning(f"({len(institutions_without_videos)} institutions ended without a downloaded video. See '{missing_output_filename}' for details.)")
-    else:
-        logging.info("Attempted to find/download a video for all institutions.")
-
-    logging.info(f"--- Download Videos Script Finished ---")
-
+    total_script_runtime = time.time() - total_start_time
+    logging.info(f"--- Bulk Video Download Script (Parallel Rolling) Finished at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
+    logging.info(f"Total script runtime: {format_time_delta(total_script_runtime)}")
+    logging.info(f"Summary: Videos Eligible for Download: {total_videos_to_attempt}, Successfully Downloaded: {videos_downloaded_this_run}, Failed Downloads: {videos_failed_this_run}")
+    logging.info(f"Total items processed (including skips/already done before submission): {videos_processed_count}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Download closest YouTube videos for each institution and dates.")
-    parser.add_argument(
-        "--search_csv", default=DEFAULT_SEARCH_CSV,
-        help=f"CSV file from channel search script (default: {DEFAULT_SEARCH_CSV})"
-    )
-    parser.add_argument(
-        "--dates_file", default=DEFAULT_DATES_FILE,
-        help=f"Text file with target dates, one per line (YYYY-MM-DD) (default: {DEFAULT_DATES_FILE})"
-    )
-    parser.add_argument(
-        "--output", default=DEFAULT_OUTPUT_CSV,
-        help=f"Path to the output CSV file for download results. Default: {DEFAULT_OUTPUT_CSV}"
-    )
+    parser = argparse.ArgumentParser(description="Download YouTube videos in parallel (rolling submission) from a database queue based on their status.")
     parser.add_argument(
         "--download-dir",
-        default=DOWNLOAD_DIR, # Default now comes from env var
-        help="Directory to download videos into. Overrides DOWNLOAD_DIR environment variable."
+        default=DOWNLOAD_DIR,
+        help=f"Directory to download videos into. Overrides DOWNLOAD_DIR env var. Default if env not set: (will raise error if None)"
     )
-
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Maximum number of videos to process in this run."
+    )
+    parser.add_argument(
+        "--status",
+        type=str,
+        default="pending,failed",
+        help="Comma-separated list of video download statuses to process (e.g., 'pending', 'failed', 'pending,failed'). Default: 'pending,failed'"
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=4, # Default to 4 workers as per user request
+        help="Maximum number of parallel download workers. Default: 4"
+    )
     args = parser.parse_args()
 
-    # Use the directory from args, which defaults to the env var
-    main(args.search_csv, args.dates_file, args.download_dir, args.output) 
+    if not args.download_dir:
+        logging.error("Download directory is not set. Please set DOWNLOAD_DIR environment variable or use --download-dir argument.")
+        exit(1)
+    
+    os.makedirs(args.download_dir, exist_ok=True)
+
+    statuses_to_process_list = [s.strip().lower() for s in args.status.split(',') if s.strip()]
+    if not statuses_to_process_list:
+        logging.error("No valid statuses provided for processing. Please check the --status argument.")
+        exit(1)
+    
+    if args.workers <= 0:
+        logging.error("Number of workers must be a positive integer.")
+        exit(1)
+
+    main(args.download_dir, args.limit, statuses_to_process_list, args.workers) 
