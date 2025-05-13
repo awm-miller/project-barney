@@ -117,6 +117,18 @@ python run_pipeline_single_table.py \\
 -   `--max-transcriptions` (optional): Limit the number of videos to transcribe.
 -   `--max-summaries` (optional): Limit the number of transcripts to summarize.
 
+### Using the HTML Command Generator (pipeline_interface.html)
+
+To simplify the process of generating the command for `run_pipeline_single_table.py`, an HTML interface (`pipeline_interface.html`) is provided in the root of the project:
+
+1.  **Open `pipeline_interface.html`** in your web browser.
+2.  **Fill in the form fields** for Job Name, Channel IDs, Title Query, and other optional parameters for the pipeline run. The Download Directory defaults to `E:\video_downloads` but can be changed.
+3.  Click the **"Generate Command"** button.
+4.  The complete command-line instruction will be displayed, formatted for easy copying.
+5.  **Copy this command** and paste it into your terminal (ensure you are in the root directory of the project) to execute the pipeline.
+
+This interface helps avoid errors from manually typing out the command and its arguments, and provides default values for some options.
+
 ### Individual Script Execution
 
 You can also run individual scripts for specific tasks if needed. Refer to each script's `--help` option for its specific arguments. For example:
@@ -177,4 +189,13 @@ The `database_manager.py` script can be used for various database operations:
 -   `google-generativeai`: For the Gemini API.
 
 (See `requirements.txt` for the full list).
+
+## Notes
+
+-   The pipeline is designed to be somewhat resilient, with status tracking in the database allowing for retries or resumption of interrupted processes.
+-   API quotas (YouTube, Google Cloud, Gemini) should be monitored, as extensive use can lead to temporary blocks. Some scripts include minor delays to help manage this, but careful planning for large datasets is advised.
+-   The `VideoTableScope` in `run_pipeline_single_table.py` ensures that the main `videos` table is not directly modified by job runs, promoting data integrity and allowing for easier management of individual job results.
+-   The `pipeline_interface.html` file provides a user-friendly way to generate the command for the main pipeline orchestrator (`run_pipeline_single_table.py`).
+-   The `customtkinter` dependency in `requirements.txt` seems unused by the core CLI pipeline scripts. It might be for an auxiliary GUI tool not included in the provided file list.
+-   The `.gitignore` file is quite broad for `*.txt` and `*.json`. Ensure necessary text/JSON data files (like `query.txt`, input CSVs, or specific non-credential JSONs) are not unintentionally ignored by adding specific exclusions (e.g., `!query.txt`) if needed.
 
