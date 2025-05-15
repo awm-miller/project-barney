@@ -9,6 +9,12 @@ import sys
 import time # Added for timing and managing workers
 import concurrent.futures # Added for parallel processing
 
+# Ensure stdout and stderr use UTF-8
+if sys.stdout.encoding != 'utf-8':
+    sys.stdout.reconfigure(encoding='utf-8')
+if sys.stderr.encoding != 'utf-8':
+    sys.stderr.reconfigure(encoding='utf-8')
+
 # Load environment variables from .env file
 load_dotenv()
 
