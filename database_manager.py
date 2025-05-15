@@ -29,6 +29,20 @@ def create_videos_table(conn):
         published_at TIMESTAMP,           -- Original publication date of the video
         added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, -- When the video was added to our DB
         
+        -- Subtitle Fetch Phase (NEW)
+        subtitle_status TEXT DEFAULT 'pending_check', -- e.g., pending_check, available, unavailable, fetched, error
+        subtitle_fetched_at TIMESTAMP,
+        subtitle_file_path TEXT,
+        subtitle_error_message TEXT,
+        text_source TEXT,                           -- To indicate origin: SUBTITLE, TRANSCRIPTION
+
+        -- Subtitle to Plain Text Conversion Phase (NEW)
+        plain_text_subtitle_path TEXT,
+        subtitle_to_text_status TEXT DEFAULT 'pending',
+        subtitle_to_text_initiated_at TIMESTAMP,
+        subtitle_to_text_completed_at TIMESTAMP,
+        subtitle_to_text_error_message TEXT,
+
         -- Download Phase
         download_status TEXT DEFAULT 'pending',
         download_initiated_at TIMESTAMP,
@@ -77,7 +91,19 @@ def create_videos_table(conn):
             ("segmentation_10w_status", "TEXT DEFAULT 'pending'"),
             ("segmentation_10w_error_message", "TEXT"),
             ("segmentation_10w_initiated_at", "TIMESTAMP"),
-            ("segmentation_10w_completed_at", "TIMESTAMP")
+            ("segmentation_10w_completed_at", "TIMESTAMP"),
+            # New subtitle columns
+            ("subtitle_status", "TEXT DEFAULT 'pending_check'"),
+            ("subtitle_fetched_at", "TIMESTAMP"),
+            ("subtitle_file_path", "TEXT"),
+            ("subtitle_error_message", "TEXT"),
+            ("text_source", "TEXT"),
+            # New subtitle to text conversion columns
+            ("plain_text_subtitle_path", "TEXT"),
+            ("subtitle_to_text_status", "TEXT DEFAULT 'pending'"),
+            ("subtitle_to_text_initiated_at", "TIMESTAMP"),
+            ("subtitle_to_text_completed_at", "TIMESTAMP"),
+            ("subtitle_to_text_error_message", "TEXT")
         ]
 
         for col_name, col_type in columns_to_add:
@@ -275,7 +301,23 @@ def reset_all_transcriptions(conn):
         segmentation_10w_error_message = NULL,
         segmentation_10w_initiated_at = NULL,
         segmentation_10w_completed_at = NULL,
+
+        -- Reset subtitle fields as well, or handle separately?
+        -- For now, let's assume a full transcription reset implies re-checking everything.
+        -- However, a more granular reset for subtitles might be needed later.
+        subtitle_status = 'pending_check', 
+        subtitle_file_path = NULL,
+        subtitle_error_message = NULL,
+        subtitle_fetched_at = NULL,
+        text_source = NULL, -- Resetting text_source if transcription is reset
         
+        -- Reset subtitle to text fields (NEW)
+        plain_text_subtitle_path = NULL,
+        subtitle_to_text_status = 'pending',
+        subtitle_to_text_initiated_at = NULL,
+        subtitle_to_text_completed_at = NULL,
+        subtitle_to_text_error_message = NULL,
+
         last_updated_at = CURRENT_TIMESTAMP;
     """
     try:
@@ -288,14 +330,19 @@ def reset_all_transcriptions(conn):
         print(f"Error resetting transcriptions: {e}")
         conn.rollback()
 
-def get_videos_for_10w_segmentation(conn, limit=None):
-    """Fetches videos that have completed word-level transcription and are pending 10w segmentation."""
+def get_videos_for_10w_segmentation(conn, limit=None, job_name: Optional[str] = None):
+    """Fetches videos that have completed word-level transcription and are pending 10w segmentation
+       AND are from a transcription source, not subtitles.
+    """
     cursor = conn.cursor()
-    sql = """
-    SELECT id, transcription_path, title
-    FROM videos
+    table_name = f"videos_{job_name}" if job_name else "videos"
+
+    sql = f"""
+    SELECT id, transcription_path, title, video_id
+    FROM {table_name}
     WHERE transcription_status = 'completed' 
       AND segmentation_10w_status = 'pending'
+      AND (text_source = 'TRANSCRIPTION' OR text_source IS NULL) -- Only process GCS transcriptions
     ORDER BY transcription_completed_at ASC -- Process older successful transcriptions first
     """
     params = []
@@ -307,7 +354,7 @@ def get_videos_for_10w_segmentation(conn, limit=None):
         cursor.execute(sql, params)
         videos = cursor.fetchall()
         video_list = [dict(zip([column[0] for column in cursor.description], row)) for row in videos]
-        print(f"Found {len(video_list)} videos for 10-word segmentation.")
+        print(f"Found {len(video_list)} videos from GCS transcription source for 10-word segmentation in table '{table_name}'.")
         return video_list
     except sqlite3.Error as e:
         print(f"Database error fetching videos for 10w segmentation: {e}")
@@ -355,6 +402,63 @@ def update_video_segmentation_10w_status(conn, video_db_id: int, status: str,
         conn.rollback()
         print(f"Database error updating video (DB ID: {video_db_id}) 10w segmentation status: {e}")
 
+def reset_videos_for_reprocessing(conn):
+    """ Resets videos to a state where they can be reprocessed from scratch,
+        keeping essential identifiers like video_id, channel_id, title, video_url,
+        and published_at.
+    """
+    # video_id, video_url, channel_id, title, published_at, added_at are preserved.
+    sql_update_videos_refined = """
+    UPDATE videos
+    SET
+        status = 'NEW',
+        source_script = NULL,
+        subtitle_status = 'pending_check',
+        subtitle_fetched_at = NULL,
+        subtitle_file_path = NULL,
+        subtitle_error_message = NULL,
+        text_source = NULL,
+        plain_text_subtitle_path = NULL,
+        subtitle_to_text_status = 'pending',
+        subtitle_to_text_initiated_at = NULL,
+        subtitle_to_text_completed_at = NULL,
+        subtitle_to_text_error_message = NULL,
+        download_status = 'pending',
+        download_initiated_at = NULL,
+        download_completed_at = NULL,
+        download_path = NULL,
+        download_error_message = NULL,
+        transcription_status = 'pending',
+        transcription_initiated_at = NULL,
+        transcription_completed_at = NULL,
+        transcription_path = NULL,
+        transcription_error_message = NULL,
+        gcs_blob_name = NULL,
+        gcp_operation_name = NULL,
+        segmented_10w_transcript_path = NULL,
+        segmentation_10w_status = 'pending',
+        segmentation_10w_error_message = NULL,
+        segmentation_10w_initiated_at = NULL,
+        segmentation_10w_completed_at = NULL,
+        analysis_status = 'pending',
+        analysis_initiated_at = NULL,
+        analysis_completed_at = NULL,
+        analysis_error_message = NULL,
+        ai_analysis_path = NULL,
+        ai_analysis_content = NULL,
+        last_updated_at = CURRENT_TIMESTAMP;
+    """
+
+    try:
+        cursor = conn.cursor()
+        cursor.execute(sql_update_videos_refined)
+        updated_rows = cursor.rowcount
+        conn.commit()
+        print(f"Successfully reset {updated_rows} videos for reprocessing.")
+    except Error as e:
+        print(f"Error resetting videos for reprocessing: {e}")
+        conn.rollback()
+
 def initialize_database():
     """Initialize the database with all required tables and indexes."""
     conn = create_connection(DATABASE_NAME)
@@ -367,36 +471,68 @@ def initialize_database():
     else:
         print("Error! Cannot create the database connection.")
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Manage the video pipeline database.")
-    parser.add_argument("--reset-transcriptions", action="store_true",
-                        help="Reset transcription status for all videos to 'pending'.")
-    # Add other arguments here if needed in the future, e.g., for other reset operations
+def main():
+    parser = argparse.ArgumentParser(description="Manage the SQLite database for the pipeline.")
     parser.add_argument("--initialize", action="store_true",
                         help="Initialize the database with all tables and indexes.")
+    parser.add_argument("--reset-stuck-downloads", action="store_true",
+                        help="Reset download status for videos stuck in 'downloading' for more than an hour.")
+    parser.add_argument("--reset-transcriptions", action="store_true",
+                        help="Reset all transcription statuses to 'pending'.")
+    parser.add_argument("--delete-before-date", type=str, help="Delete videos published before this date (YYYY-MM-DD).")
+    parser.add_argument("--reset-downloads", action="store_true", help="Reset download status for all videos.")
+    parser.add_argument("--reinitialize-soft", action="store_true", help="Resets all video processing statuses, keeping video_id, channel_id etc., to allow reprocessing.")
 
     args = parser.parse_args()
-
     connection = create_connection()
-    if connection:
-        if args.initialize:
-            print("Initializing full database...")
-            initialize_database() # Call the comprehensive initialization function
-            print("Full database initialization complete.")
-        elif args.reset_transcriptions:
-            print("Resetting all video transcription statuses to 'pending'...")
-            reset_all_transcriptions(connection)
-            # The reset_all_transcriptions function already prints its own success/error message
-        else:
-            # Default behavior if no specific action is requested: standard setup/check
-            print("Performing standard database setup/check (tables will be created if they don't exist)...")
-            create_videos_table(connection)
-            create_channels_table(connection)
-            create_processing_logs_table(connection)
-            create_published_at_index(connection) # Ensure index is also part of standard check
-            print("Standard database setup/check complete.")
 
-        connection.close()
-        print("Database connection closed.")
+    if connection is not None:
+        action_taken = False
+        if args.initialize:
+            print("Initializing database...")
+            initialize_database() # Manages its own connection internally
+            action_taken = True
+        
+        if args.reset_stuck_downloads: # Changed to 'if' to allow multiple reset types if desired, or keep as 'elif' if mutually exclusive
+            print("Resetting stuck downloads...")
+            reset_stuck_downloads(connection)
+            action_taken = True
+        
+        if args.reset_transcriptions: # Changed to 'if'
+            print("Resetting all transcriptions to 'pending'...")
+            reset_all_transcriptions(connection)
+            action_taken = True
+        
+        if args.delete_before_date: # Changed to 'if'
+            delete_videos_before_date(connection, args.delete_before_date)
+            action_taken = True
+            
+        if args.reset_downloads: # Changed to 'if'
+            reset_video_download_statuses(connection) # Assumes this is the correct function for the generic --reset-downloads
+            action_taken = True
+
+        if args.reinitialize_soft: # Changed to 'if'
+            print("Resetting all video processing statuses for reprocessing (soft reset)...")
+            reset_videos_for_reprocessing(connection)
+            action_taken = True
+
+        if not action_taken:
+            # Default behavior: standard setup/check (which `initialize_database` implicitly does via `CREATE TABLE IF NOT EXISTS`)
+            print("No specific action requested. Performing standard database setup/check...")
+            initialize_database() # Ensures tables are checked/created if no other action. Manages its own connection.
+                                  # If initialize_database() is meant to use the 'connection' object, it should be:
+                                  # create_videos_table(connection)
+                                  # create_channels_table(connection)
+                                  # create_processing_logs_table(connection)
+                                  # etc.
+                                  # The previous `read_file` showed `initialize_database` does not take args,
+                                  # implying it calls `create_connection` itself.
+
+        if connection: # Connection object from this scope, not the one initialize_database might create and close.
+            connection.close()
+            print("Database connection (main) closed.")
     else:
-        print("Failed to create database connection. No actions performed.") 
+        print("Failed to create database connection. No actions performed.")
+
+if __name__ == '__main__':
+    main() 

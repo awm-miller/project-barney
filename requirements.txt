@@ -1,6 +1,6 @@
 google-auth-oauthlib
 requests
-yt-dlp
+yt-dlp # Requires srt_fix plugin, install via: pip install https://github.com/bindestriche/srt_fix/archive/refs/heads/master.zip
 python-dotenv
 google-cloud-speech
 google-cloud-storage
@@ -8,4 +8,4 @@ google-generativeai
 google-api-python-client
 google-auth-httplib2
 dotenv
-customtkinter
+webvtt-py

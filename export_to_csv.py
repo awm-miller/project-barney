@@ -9,6 +9,7 @@ import argparse
 from datetime import datetime
 from dotenv import load_dotenv
 import re # For stripping timestamps
+import concurrent.futures # Added for parallel uploads
 
 # --- Google API Imports ---
 from google.oauth2 import service_account
@@ -30,6 +31,11 @@ GOOGLE_DRIVE_PARENT_FOLDER_ID_FOR_CSV = os.getenv("GCLOUD_FOLDER") or \
                                       os.getenv("GOOGLE_DRIVE_PARENT_FOLDER_ID_FOR_CSV") or \
                                       "YOUR_DRIVE_PARENT_FOLDER_ID_HERE"
 SCOPES = ['https://www.googleapis.com/auth/drive.file'] # Only drive.file needed
+
+# Define directories for finding subtitle files, consistent with other scripts
+DEFAULT_SUBTITLE_DIR = "subtitles" 
+DEFAULT_PLAIN_TEXT_SUBTITLE_DIR = "plain_text_subtitles"
+DEFAULT_MAX_WORKERS_EXPORT = 4 # Default workers for export uploads
 
 # --- Logging Setup ---
 logging.basicConfig(
@@ -80,6 +86,9 @@ def create_drive_folder_for_csv(drive_service, folder_name, parent_folder_id):
 
 def upload_file_to_drive_for_csv(drive_service, local_file_path, folder_id):
     """Uploads a local file to a specific Google Drive folder and returns its webViewLink."""
+    if not drive_service or not folder_id: # Added check for disabled uploads
+        logging.debug(f"Drive service or folder_id not available. Skipping upload for {local_file_path}")
+        return "Uploads disabled or folder error"
     if not os.path.exists(local_file_path):
         logging.warning(f"Local file not found, cannot upload: {local_file_path}")
         return None
@@ -147,11 +156,15 @@ def get_videos_for_csv_export(conn):
     query = """
     SELECT 
         v.id,
+        v.video_id,
         v.title,
         v.video_url,
-        v.segmented_10w_transcript_path, 
         v.published_at,
-        v.ai_analysis_content 
+        v.ai_analysis_content,
+        v.text_source,
+        v.subtitle_file_path,
+        v.plain_text_subtitle_path,
+        v.segmented_10w_transcript_path
     FROM videos v
     WHERE 
         v.analysis_status = 'completed'
@@ -166,170 +179,254 @@ def get_videos_for_csv_export(conn):
         logging.error(f"Database error fetching videos for CSV export: {e}")
         return []
 
+# --- Worker function for parallel uploads ---
+def upload_files_for_video_worker(video_data_tuple, drive_service, target_folder_id):
+    """Worker function to handle file uploads for a single video."""
+    (video_db_id, youtube_video_id, video_title, video_url, published_at_ts, 
+     ai_summary, text_source, db_subtitle_file_path, db_plain_text_subtitle_path, 
+     db_segmented_10w_transcript_path) = video_data_tuple
+
+    logging.debug(f"[Worker {youtube_video_id}] Processing uploads.")
+
+    link_eng_srt = "N/A"
+    link_arabic_txt = "N/A"
+    link_asr_transcript = "N/A"
+
+    # 1. English SRT
+    expected_eng_srt_filename = f"{youtube_video_id}.en-fixed.srt"
+    eng_srt_local_path = os.path.join(DEFAULT_SUBTITLE_DIR, expected_eng_srt_filename)
+    if os.path.exists(eng_srt_local_path):
+        drive_link = upload_file_to_drive_for_csv(drive_service, eng_srt_local_path, target_folder_id)
+        link_eng_srt = drive_link if drive_link else "Upload Failed"
+    else:
+        link_eng_srt = "English SRT not found locally"
+    
+    # 2. Arabic Plain Text from Subtitles
+    if text_source == 'SUBTITLE' and db_plain_text_subtitle_path and os.path.exists(db_plain_text_subtitle_path):
+        drive_link = upload_file_to_drive_for_csv(drive_service, db_plain_text_subtitle_path, target_folder_id)
+        link_arabic_txt = drive_link if drive_link else "Upload Failed"
+    elif text_source == 'SUBTITLE' and db_plain_text_subtitle_path:
+        link_arabic_txt = "Arabic Plain Text Subtitle file missing locally"
+    elif text_source == 'SUBTITLE':
+        link_arabic_txt = "No Arabic Plain Text Subtitle path in DB"
+    else:
+        link_arabic_txt = "N/A (Text source not SUBTITLE)"
+
+    # 3. ASR Transcript (conditional)
+    subtitles_linked = (link_eng_srt not in ["N/A", "English SRT not found locally", "Upload Failed", "Uploads disabled or folder error"]) or \
+                       (link_arabic_txt not in ["N/A", "Arabic Plain Text Subtitle file missing locally", "Upload Failed", "No Arabic Plain Text Subtitle path in DB", "N/A (Text source not SUBTITLE)", "Uploads disabled or folder error"])
+
+    if not subtitles_linked:
+        if db_segmented_10w_transcript_path and os.path.exists(db_segmented_10w_transcript_path):
+            drive_link = upload_file_to_drive_for_csv(drive_service, db_segmented_10w_transcript_path, target_folder_id)
+            link_asr_transcript = drive_link if drive_link else "Upload Failed (ASR)"
+        elif db_segmented_10w_transcript_path:
+            link_asr_transcript = "ASR transcript file missing locally"
+        else:
+            link_asr_transcript = "No ASR transcript path in DB"
+    else:
+        link_asr_transcript = "N/A (Subtitles linked)"
+    
+    # Return all data needed for the CSV row
+    return {
+        "video_db_id": video_db_id, # Keep for potential reference, though not directly in CSV
+        "youtube_video_id": youtube_video_id,
+        "Title": video_title or f"Video ID {video_db_id}",
+        "URL": format_youtube_url(video_url) if video_url else "N/A",
+        "published_at_ts": published_at_ts, # Pass through for date formatting in main thread
+        "AI summary": ai_summary or "Summary not available",
+        "link_eng_srt": link_eng_srt,
+        "link_arabic_txt": link_arabic_txt,
+        "link_asr_transcript": link_asr_transcript
+    }
+
 # --- Main Export Logic ---
-def export_data_to_csv(videos_data, csv_filename, drive_service, csv_run_drive_folder_id):
-    """Exports video data to a CSV file and uploads segmented transcripts sequentially."""
+def export_data_to_csv(videos_data, csv_filename, drive_service, csv_run_drive_folder_id, max_workers):
+    """Exports video data to a CSV file, using workers for parallel file uploads."""
     
     csv_rows_to_write = []
+    fieldnames = [
+        "Title", "URL", "AI summary", 
+        "Link to fixed srt subtitles (ENGLISH)",
+        "Link to plaintext subtitles (ARABIC)",
+        "Link to segmented transcript (ASR)",
+        "Date"
+    ]
 
     if not videos_data:
         logging.info("No video data provided. Writing empty CSV with headers.")
     else:
-        for video_row_tuple in videos_data:
-            video_db_id, video_title, video_url, segmented_10w_local_path, published_at_ts, ai_summary = video_row_tuple
-            
-            logging.info(f"Processing video ID {video_db_id}: '{video_title}'")
-            
-            published_date_str = "N/A"
-            if published_at_ts:
+        processed_video_count = 0
+        total_videos = len(videos_data)
+        logging.info(f"Starting parallel file uploads for {total_videos} videos using {max_workers} workers...")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_video_data = {
+                executor.submit(upload_files_for_video_worker, video_row_tuple, drive_service, csv_run_drive_folder_id): video_row_tuple
+                for video_row_tuple in videos_data
+            }
+
+            for future in concurrent.futures.as_completed(future_to_video_data):
+                original_video_data = future_to_video_data[future]
+                worker_video_id = original_video_data[1] # youtube_video_id from the tuple
                 try:
-                    if isinstance(published_at_ts, str):
-                        date_part = published_at_ts.split('T')[0] if 'T' in published_at_ts else published_at_ts.split(' ')[0]
-                        dt_obj = datetime.strptime(date_part, '%Y-%m-%d')
-                        published_date_str = dt_obj.strftime('%Y-%m-%d')
-                    elif isinstance(published_at_ts, datetime):
-                        published_date_str = published_at_ts.strftime('%Y-%m-%d')
-                    else:
-                        temp_str = str(published_at_ts).split(' ')[0]
-                        datetime.strptime(temp_str, '%Y-%m-%d')
-                        published_date_str = temp_str
-                except ValueError as ve:
-                    logging.warning(f"Could not parse published_at timestamp '{published_at_ts}' for video ID {video_db_id}: {ve}. Using raw.")
-                    published_date_str = published_at_ts[:10] if isinstance(published_at_ts, str) and len(published_at_ts) >= 10 else "N/A"
-                except Exception as e:
-                    logging.error(f"Unexpected error parsing date for video {video_db_id}: {published_at_ts} - {e}")
+                    upload_results = future.result() # This is the dict from the worker
+                    
+                    # Format date here from passed-through timestamp
                     published_date_str = "N/A"
+                    published_at_ts_res = upload_results["published_at_ts"]
+                    if published_at_ts_res:
+                        try:
+                            if isinstance(published_at_ts_res, str):
+                                date_part = published_at_ts_res.split('T')[0] if 'T' in published_at_ts_res else published_at_ts_res.split(' ')[0]
+                                dt_obj = datetime.strptime(date_part, '%Y-%m-%d')
+                                published_date_str = dt_obj.strftime('%Y-%m-%d')
+                            elif isinstance(published_at_ts_res, datetime):
+                                published_date_str = published_at_ts_res.strftime('%Y-%m-%d')
+                            else:
+                                temp_str = str(published_at_ts_res).split(' ')[0]
+                                datetime.strptime(temp_str, '%Y-%m-%d')
+                                published_date_str = temp_str
+                        except Exception as e_date:
+                            logging.warning(f"Error parsing date '{published_at_ts_res}' for video {upload_results['youtube_video_id']} in main thread: {e_date}")
+                            published_date_str = "N/A"
 
-            # Upload segmented transcript (if path exists)
-            segmented_transcript_drive_link = "N/A"
-            if segmented_10w_local_path and os.path.exists(segmented_10w_local_path):
-                logging.info(f"Uploading segmented transcript: {segmented_10w_local_path} to Drive folder ID: {csv_run_drive_folder_id}")
-                drive_link = upload_file_to_drive_for_csv(drive_service, segmented_10w_local_path, csv_run_drive_folder_id)
-                if drive_link:
-                    segmented_transcript_drive_link = drive_link
-                else:
-                    logging.warning(f"Failed to upload or get link for {segmented_10w_local_path}. Setting link to 'Upload Failed'")
-                    segmented_transcript_drive_link = "Upload Failed"
-            elif segmented_10w_local_path:
-                logging.warning(f"Segmented transcript path for video ID {video_db_id} exists in DB ('{segmented_10w_local_path}') but file not found locally.")
-                segmented_transcript_drive_link = "Segmented transcript file missing locally"
-            else:
-                segmented_transcript_drive_link = "No segmented transcript path in DB"
-
-            csv_rows_to_write.append({
-                "Title": video_title or f"Video ID {video_db_id}",
-                "URL": format_youtube_url(video_url) if video_url else "N/A",
-                "AI summary": ai_summary or "Summary not available",
-                "Link to Segmented Transcript (10-word)": segmented_transcript_drive_link,
-                "Date": published_date_str
-            })
+                    csv_rows_to_write.append({
+                        "Title": upload_results["Title"],
+                        "URL": upload_results["URL"],
+                        "AI summary": upload_results["AI summary"],
+                        "Link to fixed srt subtitles (ENGLISH)": upload_results["link_eng_srt"],
+                        "Link to plaintext subtitles (ARABIC)": upload_results["link_arabic_txt"],
+                        "Link to segmented transcript (ASR)": upload_results["link_asr_transcript"],
+                        "Date": published_date_str
+                    })
+                    logging.info(f"[Main Export] Successfully processed uploads for video: {upload_results['youtube_video_id']}")
+                except Exception as exc:
+                    logging.error(f"[Main Export] Error processing result for video {worker_video_id}: {exc}", exc_info=True)
+                    # Optionally, add a row indicating failure for this video if needed
+                finally:
+                    processed_video_count += 1
+                    if processed_video_count % 10 == 0 or processed_video_count == total_videos:
+                        logging.info(f"[Main Export] File upload progress: {processed_video_count}/{total_videos} videos' files processed.")
         
-    fieldnames = ["Title", "URL", "AI summary", "Link to Segmented Transcript (10-word)", "Date"]
+        logging.info("All parallel file upload tasks completed.")
+
+    # (CSV writing logic as before)
     try:
         with open(csv_filename, 'w', newline='', encoding='utf-8') as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
             if csv_rows_to_write: 
+                # Sort rows by original video_db_id if order is important and IDs are available and unique
+                # For now, appending as completed. If order needs to match DB, more complex handling is needed.
                 writer.writerows(csv_rows_to_write)
                 logging.info(f"Successfully wrote {len(csv_rows_to_write)} data rows to {csv_filename}")
-            # If csv_rows_to_write is empty (either no videos_data or processed videos yielded no rows for some reason)
-            # it will just write the header, which is fine.
-            elif not videos_data:
+            elif not videos_data: # videos_data was empty from the start
                  logging.info(f"Successfully wrote CSV with headers, but no data rows (no videos to process): {csv_filename}")
-            else: # videos_data was not empty, but csv_rows_to_write is (e.g. all uploads failed AND we decided not to add row)
-                 logging.info(f"Successfully wrote CSV with headers, but no data rows were ultimately added: {csv_filename}")
+            else: # videos_data was not empty, but csv_rows_to_write is (e.g., all workers failed before returning useful data)
+                 logging.info(f"Successfully wrote CSV with headers, but no data rows were ultimately added from processing: {csv_filename}")
 
-        return len(csv_rows_to_write) # Number of data rows written
+        return len(csv_rows_to_write)
     except IOError as e:
         logging.error(f"Could not write to CSV file {csv_filename}: {e}")
         return None 
 
 def main():
-    parser = argparse.ArgumentParser(description="Export video data to CSV, with links to segmented transcripts uploaded to Google Drive.")
+    parser = argparse.ArgumentParser(description="Export video data to CSV, with links to relevant files uploaded to Google Drive.")
     parser.add_argument(
         "--output_csv",
-        default=f"{DEFAULT_CSV_FILENAME_PREFIX}{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-        help="Output CSV file name."
+        type=str,
+        help=f"Filename for the output CSV. Default: {DEFAULT_CSV_FILENAME_PREFIX}<timestamp>.csv"
+    )
+    parser.add_argument(
+        "--no_upload",
+        action="store_true",
+        help="Disable uploading files to Google Drive (CSV will contain local paths or N/A)."
     )
     parser.add_argument(
         "--drive_parent_folder_id",
+        type=str,
         default=GOOGLE_DRIVE_PARENT_FOLDER_ID_FOR_CSV,
-        help="Google Drive Parent Folder ID for creating the transcript export subfolder."
+        help="Google Drive Parent Folder ID where the CSV and transcript subfolder will be created."
     )
     parser.add_argument(
-        "--drive_export_folder_name",
-        help="Specific name for the Google Drive folder to be created for this export run's transcripts. Defaults to CSV filename."
+        "--workers",
+        type=int,
+        default=DEFAULT_MAX_WORKERS_EXPORT,
+        help=f"Maximum number of parallel workers for file uploads. Default: {DEFAULT_MAX_WORKERS_EXPORT}"
     )
 
     args = parser.parse_args()
-    
-    output_csv_file = args.output_csv
-    drive_parent_folder_id = args.drive_parent_folder_id
-    drive_export_folder_name = args.drive_export_folder_name if args.drive_export_folder_name else os.path.splitext(os.path.basename(output_csv_file))[0] + "_transcripts"
 
+    logging.info(f"--- Starting CSV Export at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
 
-    logging.info(f"Starting CSV export to {output_csv_file}. Segmented transcripts will be uploaded to Google Drive sequentially.")
-
-    if not drive_parent_folder_id or drive_parent_folder_id == "YOUR_DRIVE_PARENT_FOLDER_ID_HERE":
-        logging.error("Google Drive parent folder ID for CSV exports is not configured. "
-                      "Set GCLOUD_FOLDER or GOOGLE_DRIVE_PARENT_FOLDER_ID_FOR_CSV in .env or script, or use --drive_parent_folder_id.")
-        sys.exit(1)
-
-    drive_service = get_google_drive_service()
-    if not drive_service:
-        logging.error("Failed to initialize Google Drive service. Cannot upload transcripts. Exiting.")
-        sys.exit(1)
-
-    # Create a unique folder for this CSV export run's transcripts
-    csv_run_drive_folder_id = create_drive_folder_for_csv(drive_service, drive_export_folder_name, drive_parent_folder_id)
-    if not csv_run_drive_folder_id:
-        logging.error(f"Failed to create Google Drive folder '{drive_export_folder_name}' for transcripts. Exiting.")
-        sys.exit(1)
-    
-    logging.info(f"Segmented transcripts for this CSV export will be uploaded to Drive folder: '{drive_export_folder_name}' (ID: {csv_run_drive_folder_id})")
-    
     conn = create_connection(DATABASE_NAME)
     if not conn:
-        logging.error("Could not connect to the database. Exiting.")
-        return
-    
-    try:
-        videos_to_export = get_videos_for_csv_export(conn)
+        logging.error("Failed to connect to the database. Exiting.")
+        sys.exit(1)
+
+    videos_data_tuples = get_videos_for_csv_export(conn)
+    conn.close()
+
+    if not videos_data_tuples:
+        logging.info("No videos found with completed AI analysis for export. Exiting.")
+        # Create an empty CSV with headers if requested, or just exit
+        if args.output_csv:
+             csv_filename_to_use = args.output_csv
+        else:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            csv_filename_to_use = f"{DEFAULT_CSV_FILENAME_PREFIX}{timestamp}.csv"
         
-        if not videos_to_export:
-            logging.info("No videos found for CSV export. Creating empty CSV with headers.")
-            fieldnames = ["Title", "URL", "AI summary", "Link to Segmented Transcript (10-word)", "Date"]
-            try:
-                with open(output_csv_file, 'w', encoding='utf-8', newline='') as csvfile:
-                    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                    writer.writeheader()
-                logging.info(f"Created empty CSV with headers: {output_csv_file}")
-                print(f"\nCSV Export process completed. No videos found to export.")
-                print(f"Output file (empty with headers): {output_csv_file}")
-            except IOError as e:
-                logging.error(f"Could not create empty CSV file {output_csv_file}: {e}")
-                print(f"\nCSV Export failed. Could not create empty CSV. Check log {LOG_FILE}.")
-            conn.close()
-            return
-        
-        rows_written = export_data_to_csv(videos_to_export, output_csv_file, drive_service, csv_run_drive_folder_id)
-        
-        if rows_written is not None: 
-            print(f"\nCSV Export process completed successfully!")
-            print(f"Output file: {output_csv_file}")
-            print(f"Segmented transcripts uploaded to Google Drive folder: '{drive_export_folder_name}' (ID: {csv_run_drive_folder_id})")
-            print(f"Total data rows written to CSV: {rows_written}")
-            if rows_written == 0 and videos_to_export: # videos_to_export was not empty at the start
-                 logging.info("CSV file created with headers, but no data rows were generated from the processed videos.")
-        else: # rows_written is None, meaning an IOError occurred
-            print(f"\nCSV Export failed during file writing. Check the log file {LOG_FILE} for details.")
-        
-    finally:
-        if conn:
-            conn.close()
-            logging.info("Database connection closed.")
-    
-    logging.info("CSV Export process completed.")
+        # Call with empty data to write headers
+        export_data_to_csv([], csv_filename_to_use, None, None, args.workers) 
+        logging.info(f"Empty CSV with headers written to {csv_filename_to_use}")
+        sys.exit(0)
+
+    drive_service = None
+    csv_run_drive_folder_id = None # ID of the subfolder for this specific CSV run
+
+    if not args.no_upload:
+        drive_service = get_google_drive_service()
+        if not drive_service:
+            logging.warning("Could not initialize Google Drive service. Files will not be uploaded. Proceeding without uploads.")
+        elif args.drive_parent_folder_id == "YOUR_DRIVE_PARENT_FOLDER_ID_HERE":
+            logging.error("Google Drive Parent Folder ID is set to placeholder. Please configure it in .env or via --drive_parent_folder_id. Disabling uploads.")
+            drive_service = None # Disable drive operations
+        else:
+            run_timestamp_for_folder = datetime.now().strftime("%Y%m%d_%H%M%S")
+            csv_run_folder_name = f"CSV_Export_Run_{run_timestamp_for_folder}"
+            csv_run_drive_folder_id = create_drive_folder_for_csv(drive_service, csv_run_folder_name, args.drive_parent_folder_id)
+            if not csv_run_drive_folder_id:
+                logging.error("Failed to create run-specific folder in Google Drive. Disabling uploads for this run.")
+                drive_service = None # Disable drive operations
+            else:
+                logging.info(f"Successfully created Google Drive folder for this run: {csv_run_folder_name} (ID: {csv_run_drive_folder_id})")
+    else:
+        logging.info("Google Drive upload is disabled via --no_upload flag.")
+
+
+    # Determine CSV filename
+    if args.output_csv:
+        csv_filename_to_use = args.output_csv
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_filename_to_use = f"{DEFAULT_CSV_FILENAME_PREFIX}{timestamp}.csv"
+
+    num_rows_written = export_data_to_csv(videos_data_tuples, csv_filename_to_use, drive_service, csv_run_drive_folder_id, args.workers)
+
+    if num_rows_written is not None:
+        logging.info(f"CSV export process completed. {num_rows_written} data rows written to {csv_filename_to_use}")
+        if drive_service and csv_run_drive_folder_id: # If uploads were active and folder was created
+            logging.info(f"Attempting to upload the main CSV file '{csv_filename_to_use}' to Drive folder ID: {csv_run_drive_folder_id}")
+            csv_drive_link = upload_file_to_drive_for_csv(drive_service, csv_filename_to_use, csv_run_drive_folder_id)
+            if csv_drive_link:
+                logging.info(f"Main CSV file uploaded to Google Drive. Link: {csv_drive_link}")
+            else:
+                logging.error(f"Failed to upload main CSV file '{csv_filename_to_use}' to Google Drive.")
+    else:
+        logging.error("CSV export process failed.")
+
+    logging.info(f"--- CSV Export Finished at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
 
 if __name__ == "__main__":
     main() 

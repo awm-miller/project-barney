@@ -76,24 +76,33 @@ def close_thread_connections():
             except Exception as e:
                 logging.warning(f"Error closing thread-local connection: {e}")
 
-def get_videos_for_summarization_from_db(conn: sqlite3.Connection, limit: int = None) -> List[Dict]:
-    """Get videos with completed 10-word segmented transcriptions for summarization."""
+def get_videos_for_summarization_from_db(conn: sqlite3.Connection, limit: int = None, job_name: Optional[str] = None) -> List[Dict]:
+    """Get videos ready for summarization, from either subtitles or transcriptions."""
     cursor = conn.cursor()
-    
-    query = '''
+    table_name = f"videos_{job_name}" if job_name else "videos"
+
+    # Path 1: Completed plain text subtitle conversion
+    # Path 2: Completed 10-word segmentation of a GCS transcription
+    query = f'''
     SELECT 
-        id, 
-        video_id, 
-        title, 
-        channel_id, 
-        segmented_10w_transcript_path AS transcription_path 
-    FROM videos 
-    WHERE segmentation_10w_status = 'completed'
-      AND (analysis_status = 'pending' OR analysis_status = 'failed')
-    ORDER BY id ASC
-    '''
-    # Note: transcription_path in the returned dict will now point to the segmented transcript.
-    
+        v.id, 
+        v.video_id, 
+        v.title, 
+        v.channel_id, 
+        v.text_source, 
+        v.plain_text_subtitle_path,    -- Path if text_source is SUBTITLE
+        v.segmented_10w_transcript_path -- Path if text_source is TRANSCRIPTION
+    FROM {table_name} v
+    WHERE (v.analysis_status = \'pending\' OR v.analysis_status = \'failed\')
+      AND (
+            (v.text_source = \'SUBTITLE\' AND v.subtitle_to_text_status = \'completed\' AND v.plain_text_subtitle_path IS NOT NULL)
+            OR 
+            ( (v.text_source = \'TRANSCRIPTION\' OR v.text_source IS NULL) -- IS NULL for legacy
+              AND v.segmentation_10w_status = \'completed\' AND v.segmented_10w_transcript_path IS NOT NULL
+            )
+          )
+    ORDER BY v.last_updated_at ASC -- Process videos that haven't been touched recently first, or by added_at
+    '''    
     if limit:
         query += f' LIMIT {limit}'
     
@@ -101,15 +110,27 @@ def get_videos_for_summarization_from_db(conn: sqlite3.Connection, limit: int = 
     
     results = []
     for row in cursor.fetchall():
+        video_db_id, youtube_video_id, video_title, channel_id, text_source, plain_text_path, segmented_path = row
+        
+        source_text_file_path = None
+        if text_source == 'SUBTITLE' and plain_text_path:
+            source_text_file_path = plain_text_path
+        elif (text_source == 'TRANSCRIPTION' or text_source is None) and segmented_path: # text_source IS NULL for legacy cases
+            source_text_file_path = segmented_path
+        else:
+            logging.warning(f"Video DB ID {video_db_id} matched for summarization but has inconsistent text_source ('{text_source}') or missing paths. Skipping.")
+            continue
+
         results.append({
-            'video_db_id': row[0],
-            'youtube_video_id': row[1],
-            'video_title': row[2],
-            'channel_id': row[3],
-            'transcription_path': row[4]
+            'video_db_id': video_db_id,
+            'youtube_video_id': youtube_video_id,
+            'video_title': video_title,
+            'channel_id': channel_id,
+            'text_source': text_source, # Important for knowing how the text was derived
+            'source_text_path': source_text_file_path # Unified path to the text to be summarized
         })
     
-    logging.info(f"Found {len(results)} videos with 10w-segmented transcripts ready for summarization.")
+    logging.info(f"Found {len(results)} videos ready for summarization (from subtitles or transcriptions) in table '{table_name}'.")
     return results
 
 def update_video_summary_db(
@@ -197,7 +218,8 @@ def summarize_transcript(
     video_db_id = video_info['video_db_id']
     youtube_video_id = video_info['youtube_video_id'] 
     video_title = video_info['video_title']
-    transcript_path = video_info['transcription_path']
+    source_text_path = video_info['source_text_path']
+    text_source_type = video_info['text_source']
     
     result = {
         'video_db_id': video_db_id,
@@ -212,7 +234,7 @@ def summarize_transcript(
         update_video_summary_db(
             conn, 
             video_db_id, 
-            "summarizing", 
+            "summarizing",
             initiated=True
         )
         
@@ -221,12 +243,12 @@ def summarize_transcript(
             video_db_id,
             stage="summary",
             status="initiated",
-            message=f"Starting summarization of transcript for video: {video_title}"
+            message=f"Starting summarization of text (source: {text_source_type if text_source_type else 'transcription'}) for video: {video_title}"
         )
         
         # Check if transcript file exists
-        if not os.path.exists(transcript_path):
-            error_msg = f"Transcript file not found: {transcript_path}"
+        if not source_text_path or not os.path.exists(source_text_path):
+            error_msg = f"Source text file not found: {source_text_path}"
             logging.error(error_msg)
             update_video_summary_db(
                 conn, 
@@ -246,7 +268,7 @@ def summarize_transcript(
         
         # Read transcript content
         try:
-            with open(transcript_path, 'r', encoding='utf-8') as f:
+            with open(source_text_path, 'r', encoding='utf-8') as f:
                 transcript_content = f.read()
             
             add_processing_log_db(
@@ -341,7 +363,7 @@ If the transcript is empty, unclear, or doesn't contain enough content to summar
                 return result
                 
         except Exception as e:
-            error_msg = f"Error reading transcript file {transcript_path}: {str(e)}"
+            error_msg = f"Error reading transcript file {source_text_path}: {str(e)}"
             logging.error(error_msg)
             update_video_summary_db(
                 conn, 

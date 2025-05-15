@@ -71,10 +71,11 @@ def get_videos_for_transcription_from_db(conn, limit=None):
     # Select videos that have been successfully downloaded AND
     # whose transcription status is either pending or failed.
     sql = """
-    SELECT id, download_path, title, transcription_status
+    SELECT id, download_path, title, transcription_status, video_id
     FROM videos
     WHERE download_status = 'completed' 
       AND (transcription_status = 'pending' OR transcription_status = 'failed')
+      AND (text_source IS NULL OR text_source != 'SUBTITLE')
     ORDER BY added_at ASC
     """
     params = []
@@ -87,7 +88,7 @@ def get_videos_for_transcription_from_db(conn, limit=None):
         videos = cursor.fetchall()
         # Convert to list of dictionaries for easier access
         video_list = [dict(zip([column[0] for column in cursor.description], row)) for row in videos]
-        logging.info(f"Found {len(video_list)} videos for transcription from database (pending or failed).")
+        logging.info(f"Found {len(video_list)} videos for transcription (downloaded, not yet transcribed, and no usable subtitles).")
         return video_list
     except sqlite3.Error as e:
         logging.error(f"Database error fetching videos for transcription: {e}")
@@ -119,6 +120,9 @@ def update_video_transcription_status_db(conn, video_db_id: int, status_str: str
         parameters.append(error_msg_str)
     elif status_str == 'completed' or status_str == 'pending': # Clear error on success or reset to pending
         set_clauses.append("transcription_error_message = NULL")
+    
+    if status_str == 'completed':
+        set_clauses.append("text_source = 'TRANSCRIPTION'")
         
     # Handle timestamps
     if initiated:

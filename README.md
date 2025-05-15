@@ -1,201 +1,199 @@
-# YouTube Video Processing Pipeline
+# Video Processing and Analysis Pipeline
 
-This project is a Python-based pipeline for searching, downloading, transcribing, summarizing, and exporting data about YouTube videos. It is designed to process videos in stages, using a central SQLite database to manage the state of each video throughout the pipeline.
+This project is a comprehensive pipeline for fetching, processing, analyzing, and exporting data for YouTube videos. It includes functionalities for subtitle retrieval and fixing, video downloading, transcription, AI-powered summarization, and structured data export.
 
 ## Features
 
-- **Channel Discovery**: Find YouTube channel IDs based on a list of institution names.
-- **Targeted Video Search**: Search for videos within specific channels based on keywords in video titles.
-- **Video Downloading**: Download videos using `yt-dlp`.
-- **Arabic Speech-to-Text**: Transcribe audio from videos into Arabic with word-level timestamps using Google Cloud Speech-to-Text.
-- **Transcript Segmentation**: Process word-level transcripts into 10-word segments.
-- **AI Summarization**: Generate concise English summaries from Arabic transcripts using Google's Gemini API.
-- **Data Export**: Export processed data (summaries, video details) to CSV, and upload transcripts to Google Drive.
-- **Database-Driven Workflow**: A SQLite database tracks video status and metadata across all processing stages.
-- **Isolated Job Execution**: Run the entire pipeline for specific "jobs," with results stored in separate, versioned tables.
-- **Modular Scripts**: Each stage of the pipeline is handled by a dedicated Python script.
-
-## Project Structure
-
-The pipeline consists of several core Python scripts:
-
--   **`database_manager.py`**: Defines and manages the SQLite database schema (`pipeline_database.db`).
--   **`find_youtube_channels_by_keyword.py`**: Discovers YouTube channels based on institution names.
--   **`search_channel_videos_for_keyword.py`**: Searches for videos within channels by title keywords.
--   **`download_videos.py`**: Downloads videos listed in the database.
--   **`transcribe_videos.py`**: Extracts audio, transcribes it using Google Cloud Speech-to-Text.
--   **`segment_transcripts_10w.py`**: Segments word-level transcripts into 10-word chunks.
--   **`ai_call.py` (summarize_transcripts.py)**: Generates summaries using the Gemini API.
--   **`export_to_csv.py`**: Exports data to CSV and uploads transcripts to Google Drive.
--   **`run_pipeline_single_table.py`**: Orchestrates the execution of the entire pipeline for a specific job, ensuring data isolation.
-
-Utility scripts:
--   **`retry_pending_downloads.py`**: Retries downloading videos marked as 'pending'.
--   **`list_videos_by_date.py`**: Lists videos from the database, sorted by publication date.
--   **`channel_search.py`**: A wrapper to quickly run `search_channel_videos_for_keyword.py` for a hardcoded channel and a query from `query.txt`.
-
-## Prerequisites
-
--   Python 3.x
--   `ffmpeg` installed and accessible in the system PATH (for audio extraction).
--   Google Cloud Platform account with:
-    -   Speech-to-Text API enabled.
-    -   Cloud Storage API enabled (for temporary audio storage).
-    -   Service account credentials (`serviceaccount_credentials.json`).
--   Google Gemini API key.
--   YouTube Data API key.
--   Google Drive API enabled (for transcript export).
+*   **Subtitle Fetching:** Downloads subtitles for YouTube videos, with a preference for SRT format.
+*   **Subtitle Conversion & Fixing:** Converts VTT to SRT and utilizes the `srt_fix` plugin with `yt-dlp` to correct overlapping subtitle timings.
+*   **SRT to Timestamped Text:** Converts fixed SRT subtitles into plain text files while preserving timestamps (MM:SS Text format).
+*   **Video Downloading:** Downloads videos directly as a fallback if subtitles are unavailable or processing fails.
+*   **AI Summarization:** Uses Google's Gemini API to generate summaries of video content (from subtitles or ASR transcripts).
+*   **Parallel Processing:** Employs multithreading for efficient batch processing in scripts like `fetch_subtitles.py`, `download_videos.py`, `ai_call.py`, and `export_to_csv.py`.
+*   **Retry Logic:** Implements retry mechanisms for failed subtitle fetching attempts.
+*   **Database Management:** Uses SQLite to track video metadata, processing status, and file paths.
+*   **CSV Export:** Exports processed data into a CSV file, including titles, URLs, AI summaries, and links to relevant files (SRT, plain text subtitles, ASR transcripts) uploaded to Google Drive.
+*   **Google Drive Integration:** Uploads subtitle files and ASR transcripts to a specified Google Drive folder during the CSV export process.
+*   `run_pipeline.py`: Orchestrates the main processing pipeline, running various stages from subtitle fetching/conversion, video downloading/transcription/segmentation (as fallback), AI summarization, to CSV export.
+    *   Provides a centralized way to run the common workflow.
+    *   Accepts `--workers` argument for stages that support parallel processing.
+    *   Allows skipping specific stages (e.g., `--skip_fetch_subtitles`, `--skip_ai_summarize`).
+    *   Supports limit arguments for most stages (e.g. `--fetch_limit`, `--ai_max_videos`).
+    *   Logs its own operations and the output of called scripts to `pipeline_run.log`.
 
 ## Setup
 
-1.  **Clone the repository:**
+### Prerequisites
+
+*   Python 3.x
+*   `pip` (Python package installer)
+
+### Installation
+
+1.  **Clone the repository (if applicable):**
     ```bash
-    git clone <repository-url>
-    cd <repository-directory>
+    git clone <your-repository-url>
+    cd <your-repository-directory>
     ```
 
-2.  **Create a virtual environment (recommended):**
+2.  **Create and activate a virtual environment (recommended):**
     ```bash
     python -m venv venv
-    source venv/bin/activate  # On Windows: venv\\Scripts\\activate
+    # On Windows
+    venv\Scripts\activate
+    # On macOS/Linux
+    source venv/bin/activate
     ```
 
-3.  **Install dependencies:**
+3.  **Install Python dependencies:**
     ```bash
     pip install -r requirements.txt
     ```
 
-4.  **Configure Environment Variables:**
-    Create a `.env` file in the root directory of the project and populate it with the necessary API keys, GCS bucket details, and directory paths. Example:
+4.  **Install `yt-dlp` subtitle fixer plugin:**
+    The `srt_fix` plugin is used by `fetch_subtitles.py` to correct overlapping subtitles (common on Youtube). Install it via pip:
+    ```bash
+    pip install https://github.com/bindestriche/srt_fix/archive/refs/heads/master.zip
+    ```
+
+5.  **Set up Environment Variables:**
+    Create a `.env` file in the root of the project directory and add the following variables. Replace placeholder values with your actual credentials and IDs.
+
     ```env
-    YOUTUBE_API_KEY="YOUR_YOUTUBE_API_KEY"
-    GEMINI_API_KEY="YOUR_GEMINI_API_KEY"
+    # For Google Cloud services (Speech-to-Text, Drive API)
     GOOGLE_APPLICATION_CREDENTIALS="path/to/your/serviceaccount_credentials.json"
 
-    DOWNLOAD_DIR="path/to/your/download_directory"
-    TRANSCRIPTS_DIR="path/to/your/transcripts_directory" # For word-level transcripts
-    DEFAULT_SEGMENTED_TRANSCRIPTS_DIR="path/to/your/segmented_transcripts_directory" # Used by segment_transcripts_10w.py
-    ANALYSIS_DIR="path/to/your/analysis_output_directory" # For AI summaries (if saved as files, though current script saves to DB)
+    # For Gemini API (used in ai_call.py for summarization)
+    GEMINI_API_KEY="YOUR_GEMINI_API_KEY"
 
-    GCS_BUCKET_NAME="your-gcs-bucket-name"
-    # Parent Google Drive folder ID for CSV export transcript uploads
+    # For Google Drive export (export_to_csv.py)
+    # Parent folder ID in Google Drive where export subfolders will be created
     GCLOUD_FOLDER="YOUR_GOOGLE_DRIVE_PARENT_FOLDER_ID"
-    # OR (more specific, overrides GCLOUD_FOLDER for CSV export if present)
-    # GOOGLE_DRIVE_PARENT_FOLDER_ID_FOR_CSV="YOUR_DRIVE_PARENT_FOLDER_ID_FOR_CSV"
-    ```
-    Ensure the specified directories exist or the scripts have permissions to create them.
+    # Alternatively, you can use the more specific variable below if GCLOUD_FOLDER is used for other purposes
+    # GOOGLE_DRIVE_PARENT_FOLDER_ID_FOR_CSV="YOUR_GOOGLE_DRIVE_PARENT_FOLDER_ID"
 
-5.  **Initialize the Database:**
-    Run the database manager to create the necessary tables:
+    # Optional: Directory for AI analysis output (used by ai_call.py, if it writes local files beyond DB updates)
+    # ANALYSIS_DIR="./analysis_output" # Example path
+
+    # Optional: Cookies file for yt-dlp if needed for certain videos
+    # COOKIES_FILE_PATH="./cookies.txt"
+    ```
+    *   Ensure your `serviceaccount_credentials.json` has the necessary permissions for Google Drive (if uploading) and Google Cloud Speech-to-Text (if `transcribe_videos.py` is used).
+    *   The `GEMINI_API_KEY` is required for the `ai_call.py` script.
+
+6.  **Initialize the Database:**
+    The pipeline uses an SQLite database (`pipeline_database.db`) to track video information and processing states.
+    *   To create the database schema for the first time:
+        ```bash
+        python database_manager.py --initialize
+        ```
+    *   To re-initialize the database while preserving existing video and channel IDs but resetting processing statuses (useful for reprocessing):
+        ```bash
+        python database_manager.py --reinitialize-soft
+        ```
+
+## Pipeline Scripts Overview
+
+The project consists of several Python scripts that form the processing pipeline:
+
+*   `database_manager.py`: Manages the SQLite database schema and provides utility functions for database interaction.
+*   `find_youtube_channels_by_keyword.py`: Tries to find Youtube channels based on keywords
+*   `search_channel_videos_for_keyword.py`: Searches for videos within specific channels based on keywords.
+*   `fetch_subtitles.py`: Fetches subtitles for videos from the database.
+    *   Attempts to download SRT files directly.
+    *   Uses `yt-dlp` with the `--convert-subs srt` flag.
+    *   Employs the `srt_fix` postprocessor (`--use-postprocessor srt_fix:when=before_dl`) to fix timing issues, looking for `*-fixed.srt` files.
+    *   Supports parallel fetching using the `--workers` argument.
+    *   Includes retry logic for videos that initially fail or have 'unavailable' subtitle status.
+    *   Use `--limit <number>` to process a specific number of videos.
+*   `convert_subtitle_to_text.py`: Converts downloaded `.srt` subtitle files into plain text files with timestamps (`MM:SS Text`).
+    *   Strips sequence numbers and manages blank lines.
+    *   Use `--limit <number>` to process a specific number of videos.
+*   `download_videos.py`: Downloads the actual video files. This is often used as a fallback if subtitles cannot be fetched.
+    *   Supports parallel downloading using the `--workers` argument.
+    *   Use `--limit <number>` to process a specific number of videos.
+*   `transcribe_videos.py`: Transcribes audio from downloaded videos using a speech-to-text service (likely Google Cloud Speech).
+*   `segment_transcripts_10w.py`: Segments ASR transcripts into smaller chunks (e.g., 10-word segments).
+*   `ai_call.py`: Takes text input (either from plain text subtitles or segmented ASR transcripts) and generates an AI summary using the Gemini API.
+    *   Supports parallel processing using the `--workers` argument.
+*   `export_to_csv.py`: Exports processed video data to a CSV file.
+    *   Uploads English fixed SRT files (`.en-fixed.srt`), Arabic plain text subtitle files, and conditionally ASR transcripts to a timestamped subfolder in Google Drive.
+    *   The CSV includes video title, URL, AI summary, links to the uploaded files, and publication date.
+    *   Supports parallel uploads using the `--workers` argument.
+    *   Use `--no_upload` to disable Google Drive uploads.
+*   `run_pipeline.py`: Orchestrates the main processing pipeline, running various stages from subtitle fetching/conversion, video downloading/transcription/segmentation (as fallback), AI summarization, to CSV export.
+    *   Provides a centralized way to run the common workflow.
+    *   Accepts `--workers` argument for stages that support parallel processing.
+    *   Allows skipping specific stages (e.g., `--skip_fetch_subtitles`, `--skip_ai_summarize`).
+    *   Supports limit arguments for most stages (e.g. `--fetch_limit`, `--ai_max_videos`).
+    *   Logs its own operations and the output of called scripts to `pipeline_run.log`.
+
+## Usage
+
+The pipeline can be run by executing individual scripts or, more conveniently, by using the `run_pipeline.py` orchestrator script.
+
+**Using the Orchestrator Script (`run_pipeline.py`):**
+
+This is the recommended way to run the main processing flow.
+
+1.  **Run the full pipeline (subtitle path, then transcription fallback if needed, summarization, and export):**
     ```bash
-    python database_manager.py --initialize
+    python run_pipeline.py --workers 4
     ```
 
-## Running the Pipeline
+2.  **Run the pipeline, skipping subtitle fetching and conversion (forcing download/transcription path):**
+    ```bash
+    python run_pipeline.py --skip_fetch_subtitles --skip_convert_subtitles --workers 4
+    ```
 
-The main way to run the full pipeline for a specific set of inputs is using `run_pipeline_single_table.py`.
+3.  **Run only the summarization and export steps:**
+    ```bash
+    python run_pipeline.py --skip_fetch_subtitles --skip_convert_subtitles --skip_download_videos --skip_transcribe_videos --skip_segment_transcripts --workers 4
+    ```
 
+4.  **Run with limits on specific stages:**
+    ```bash
+    python run_pipeline.py --workers 2 --fetch_limit 10 --ai_max_videos 5
+    ```
+
+Refer to the orchestrator's help for all available options:
 ```bash
-python run_pipeline_single_table.py \\
-    --job-name "my_specific_job" \\
-    --channels "CHANNEL_ID_1,CHANNEL_ID_2" \\
-    --title-query "keyword_in_title" \\
-    --download-dir "./downloads" \\
-    --workers 4 \\
-    --max-downloads 10 \\
-    --max-transcriptions 5 \\
-    --max-summaries 5
+python run_pipeline.py --help
 ```
 
-**Explanation of Arguments for `run_pipeline_single_table.py`:**
--   `--job-name`: A unique name for this pipeline run. Results will be stored in a table like `videos_my_specific_job_TIMESTAMP`.
--   `--channels`: Comma-separated YouTube channel IDs to search.
--   `--title-query`: Keyword(s) to search for in video titles.
--   `--download-dir`: Directory to save downloaded videos.
--   `--workers`: Number of parallel workers for the download stage.
--   `--max-downloads` (optional): Limit the number of videos to download.
--   `--max-transcriptions` (optional): Limit the number of videos to transcribe.
--   `--max-summaries` (optional): Limit the number of transcripts to summarize.
+**Example (running individual steps manually):**
 
-### Using the HTML Command Generator (pipeline_interface.html)
+While `run_pipeline.py` is preferred, individual scripts can still be run:
 
-To simplify the process of generating the command for `run_pipeline_single_table.py`, an HTML interface (`pipeline_interface.html`) is provided in the root of the project:
-
-1.  **Open `pipeline_interface.html`** in your web browser.
-2.  **Fill in the form fields** for Job Name, Channel IDs, Title Query, and other optional parameters for the pipeline run. The Download Directory defaults to `E:\video_downloads` but can be changed.
-3.  Click the **"Generate Command"** button.
-4.  The complete command-line instruction will be displayed, formatted for easy copying.
-5.  **Copy this command** and paste it into your terminal (ensure you are in the root directory of the project) to execute the pipeline.
-
-This interface helps avoid errors from manually typing out the command and its arguments, and provides default values for some options.
-
-### Individual Script Execution
-
-You can also run individual scripts for specific tasks if needed. Refer to each script's `--help` option for its specific arguments. For example:
-
--   **Find Channels:**
+1.  **Fetch subtitles (with 4 workers, processing all eligible videos):**
     ```bash
-    python find_youtube_channels_by_keyword.py --institutions unique_institutions.csv
-    ```
-    (Ensure `unique_institutions.csv` contains one institution name per line.)
-
--   **Download Videos (processes videos not yet 'completed'):**
-    ```bash
-    python download_videos.py --download-dir ./downloads --workers 4 --limit 20
+    python fetch_subtitles.py --workers 4
     ```
 
--   **Transcribe Videos:**
+2.  **Convert newly fetched SRTs to text (processing all eligible):**
     ```bash
-    python transcribe_videos.py --max-videos 10
+    python convert_subtitle_to_text.py
     ```
 
--   **Segment Transcripts:**
+3.  **Run AI summarization (with 4 workers, processing all eligible):**
     ```bash
-    python segment_transcripts_10w.py --output-dir ./transcripts_segmented --max-videos 10
+    python ai_call.py --workers 4
     ```
 
--   **Summarize Transcripts (AI Call):**
+4.  **Export data to CSV (with 4 workers for uploads):**
     ```bash
-    python ai_call.py --max-videos 10 --max-workers 2
+    python export_to_csv.py --workers 4
     ```
 
--   **Export to CSV:**
-    ```bash
-    python export_to_csv.py --output_csv "export_run_$(date +%Y%m%d).csv"
-    ```
-    *(Note: `export_to_csv.py` uses `--output_csv`, while `run_pipeline_single_table.py` calls it with `--output` which might need adjustment in the orchestrator or the script for consistency.)*
+Refer to the arguments of each script (e.g., by running `python <script_name>.py --help`) for more specific options.
 
+## Key Directories
 
-## Database Management
+*   `subtitles/`: Stores downloaded and fixed SRT subtitle files (e.g., `VIDEO_ID.lang-fixed.srt`).
+*   `plain_text_subtitles/`: Stores plain text versions of subtitles (e.g., `VIDEO_ID.lang.txt`).
+*   `videos/`: (Assumed) Default directory for downloaded video files.
+*   `transcripts/`: (Assumed) Directory for ASR transcript files.
 
-The `database_manager.py` script can be used for various database operations:
+## Logging
 
--   **Initialize Database (creates all tables and indexes):**
-    ```bash
-    python database_manager.py --initialize
-    ```
--   **Reset Transcription Statuses (sets all to 'pending'):**
-    ```bash
-    python database_manager.py --reset-transcriptions
-    ```
-    (Other reset/maintenance functions are available within the script but may not have command-line triggers.)
-
-## Key Dependencies
-
--   `google-api-python-client`: For Google APIs (YouTube, Drive).
--   `yt-dlp`: For downloading YouTube videos.
--   `python-dotenv`: For managing environment variables.
--   `google-cloud-speech` & `google-cloud-storage`: For Google Cloud services.
--   `google-generativeai`: For the Gemini API.
-
-(See `requirements.txt` for the full list).
-
-## Notes
-
--   The pipeline is designed to be somewhat resilient, with status tracking in the database allowing for retries or resumption of interrupted processes.
--   API quotas (YouTube, Google Cloud, Gemini) should be monitored, as extensive use can lead to temporary blocks. Some scripts include minor delays to help manage this, but careful planning for large datasets is advised.
--   The `VideoTableScope` in `run_pipeline_single_table.py` ensures that the main `videos` table is not directly modified by job runs, promoting data integrity and allowing for easier management of individual job results.
--   The `pipeline_interface.html` file provides a user-friendly way to generate the command for the main pipeline orchestrator (`run_pipeline_single_table.py`).
--   The `customtkinter` dependency in `requirements.txt` seems unused by the core CLI pipeline scripts. It might be for an auxiliary GUI tool not included in the provided file list.
--   The `.gitignore` file is quite broad for `*.txt` and `*.json`. Ensure necessary text/JSON data files (like `query.txt`, input CSVs, or specific non-credential JSONs) are not unintentionally ignored by adding specific exclusions (e.g., `!query.txt`) if needed.
-
+Most scripts generate log files (e.g., `fetch_subtitles.log`, `summarize_transcripts.log`, `export_to_csv.log`) in the project's root directory. The `run_pipeline.py` script also creates `pipeline_run.log`, which captures the overall orchestration process and the output of the scripts it calls. These logs are crucial for monitoring and troubleshooting. 

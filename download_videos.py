@@ -54,7 +54,8 @@ def get_videos_to_download_from_db(conn, limit=None):
         c.channel_title
     FROM videos v
     LEFT JOIN channels c ON v.channel_id = c.channel_id
-    WHERE v.download_status IS NULL OR v.download_status != 'completed'
+    WHERE (v.download_status IS NULL OR v.download_status != 'completed')
+      AND (v.subtitle_status IS NULL OR v.subtitle_status = 'unavailable' OR v.subtitle_status = 'error')
     ORDER BY v.published_at DESC, v.added_at ASC
     """
     params = []
@@ -65,7 +66,7 @@ def get_videos_to_download_from_db(conn, limit=None):
     try:
         cursor.execute(sql, params)
         videos_data = cursor.fetchall()
-        logging.info(f"Found {len(videos_data)} videos not marked as 'completed' to process from database.")
+        logging.info(f"Found {len(videos_data)} videos not marked as 'completed' AND where subtitles are unavailable/errored, to process from database.")
         return [dict(zip([column[0] for column in cursor.description], row)) for row in videos_data]
     except sqlite3.Error as e:
         logging.error(f"Database error fetching videos to download: {e}")
@@ -194,7 +195,7 @@ def main(effective_download_dir: str, download_limit: int | None, statuses_to_pr
     total_start_time = time.time()
     logging.info(f"--- Starting Bulk Video Download Script (Parallel Rolling) at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
     logging.info(f"Videos will be downloaded to: {effective_download_dir}")
-    logging.info(f"Processing videos not marked as 'completed'.")
+    logging.info(f"Processing videos not marked as 'completed' AND where subtitles are unavailable or errored.")
     logging.info(f"Using a maximum of {max_workers} parallel workers (rolling submission).")
     if download_limit:
         logging.info(f"Will attempt to process at most {download_limit} videos this run.")

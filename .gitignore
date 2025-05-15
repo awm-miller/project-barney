@@ -7,3 +7,5 @@ __pycache__/
 *.log
 transcripts/
 *.db
+subtitles/
+plain_text_subtitles/
