@@ -79,7 +79,7 @@ def close_thread_connections():
 def get_videos_for_summarization_from_db(conn: sqlite3.Connection, limit: int = None, job_name: Optional[str] = None) -> List[Dict]:
     """Get videos ready for summarization, from either subtitles or transcriptions."""
     cursor = conn.cursor()
-    table_name = f"videos_{job_name}" if job_name else "videos"
+    table_name = "videos" # Always use the main videos table
 
     # Path 1: Completed plain text subtitle conversion
     # Path 2: Completed 10-word segmentation of a GCS transcription

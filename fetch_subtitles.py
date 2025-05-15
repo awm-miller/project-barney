@@ -36,12 +36,12 @@ def create_connection(db_file=DATABASE_NAME):
 def get_videos_to_fetch_subtitles(conn, limit=None, job_name=None):
     """Fetches videos pending subtitle check OR those with previous errors/unavailability."""
     cursor = conn.cursor()
-    table_name = f"videos_{job_name}" if job_name else "videos"
+    table_name = "videos" # Always use the main videos table
 
     sql = f"""
     SELECT id, video_id, video_url, title
     FROM {table_name}
-    WHERE subtitle_status = 'error' OR subtitle_status = 'unavailable'
+    WHERE subtitle_status = 'pending_check' OR subtitle_status = 'error' OR subtitle_status = 'unavailable'
     ORDER BY added_at ASC
     """
     params = []
@@ -71,7 +71,7 @@ def update_video_subtitle_status(conn, video_db_id: int, status: str,
     # Here, updates are done in main based on worker results, so existing conn is fine.
 
     cursor = conn.cursor()
-    table_name = f"videos_{job_name}" if job_name else "videos"
+    table_name = "videos" # Always use the main videos table
 
     set_clauses = ["subtitle_status = ?"]
     parameters = [status]

@@ -24,7 +24,7 @@ def create_connection(db_file=DATABASE_NAME):
 
 def get_videos_for_conversion(conn, limit=None, job_name=None):
     cursor = conn.cursor()
-    table_name = f"videos_{job_name}" if job_name else "videos"
+    table_name = "videos" # Always use the main videos table
     sql = f"""
     SELECT id, video_id, subtitle_file_path, title
     FROM {table_name}
@@ -50,7 +50,7 @@ def update_video_conversion_status(conn, video_db_id: int, status: str,
                                    plain_text_path: str = None, error_message: str = None, 
                                    job_name: str = None):
     cursor = conn.cursor()
-    table_name = f"videos_{job_name}" if job_name else "videos"
+    table_name = "videos" # Always use the main videos table
     
     set_clauses = ["subtitle_to_text_status = ?"]
     parameters = [status]

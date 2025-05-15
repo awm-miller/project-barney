@@ -35,7 +35,7 @@ SCOPES = ['https://www.googleapis.com/auth/drive.file'] # Only drive.file needed
 # Define directories for finding subtitle files, consistent with other scripts
 DEFAULT_SUBTITLE_DIR = "subtitles" 
 DEFAULT_PLAIN_TEXT_SUBTITLE_DIR = "plain_text_subtitles"
-DEFAULT_MAX_WORKERS_EXPORT = 4 # Default workers for export uploads
+DEFAULT_MAX_WORKERS_EXPORT = 1 # Default workers for export uploads
 
 # --- Logging Setup ---
 logging.basicConfig(
