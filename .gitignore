@@ -9,3 +9,5 @@ transcripts/
 *.db
 subtitles/
 plain_text_subtitles/
+databases/
+app_data/

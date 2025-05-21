@@ -1,0 +1,38 @@
+[project]
+name = "C-Beam"
+version = "0.1.0"
+description = "C-Beam"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+    { name = "Alex", email = "alex@counterextremism.org.uk" } # Please update this
+]
+dependencies = [
+  "flet",
+  "google-auth-oauthlib",
+  "requests",
+  "yt-dlp",
+  "python-dotenv",
+  "google-cloud-speech",
+  "google-cloud-storage",
+  "google-generativeai",
+  "google-api-python-client",
+  "webvtt-py",
+  "google-auth-httplib2"
+]
+
+[tool.flet]
+# General Flet settings
+org = "org.uk.counterextremism" # Reverse domain name notation for your organization
+product = "C-Beam" # Name of the product
+company = "Counter Extremism Group" # Company Name
+copyright = "Copyright (C) 2025 Counter Extremism Group" # Copyright notice
+
+app.module = "main" 
+
+
+[tool.flet.app]
+path = "src"
+module_name = "main" # Specifies src/main.py as the entry
+assets_dir = "src/assets" # This tells flet build to look for assets in src/assets
+

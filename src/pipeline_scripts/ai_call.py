@@ -24,6 +24,7 @@ load_dotenv()
 # --- Configuration ---
 LOG_FILE = "summarize_transcripts.log"
 SCRIPT_NAME = "summarize_transcripts.py"
+DEFAULT_DB_NAME = DATABASE_NAME # Default to the one from database_manager
 
 # Get required paths from environment variables
 ANALYSIS_DIR = os.getenv("ANALYSIS_DIR")
@@ -50,31 +51,40 @@ logging.basicConfig(
 )
 
 # --- Database Functions ---
-def get_db_connection() -> sqlite3.Connection:
+def get_db_connection(db_name: str = DEFAULT_DB_NAME) -> sqlite3.Connection:
     """Get a thread-local database connection."""
     if not hasattr(thread_local, "connections"):
         thread_local.connections = {}
         
     thread_id = threading.get_ident()
-    if thread_id not in thread_local.connections or thread_local.connections[thread_id] is None:
-        # Create a new connection for this thread
-        connection = create_connection(DATABASE_NAME)
-        thread_local.connections[thread_id] = connection
-        logging.debug(f"Created new database connection for thread {thread_id}")
-    
-    return thread_local.connections[thread_id]
+    # Use a tuple of (thread_id, db_name) as key to support multiple DBs per thread if ever needed,
+    # or simply ensure connections are specific to the db_name.
+    # For now, let's assume one connection per thread for a given db_name run.
+    # If db_name changes mid-thread (not expected here), this logic might need refinement.
+    # However, db_name is passed down from the main thread and should be consistent per worker.
 
-def close_thread_connections():
-    """Close all database connections for the current thread."""
+    connection_key = (thread_id, db_name)
+
+    if connection_key not in thread_local.connections or thread_local.connections[connection_key] is None:
+        # Create a new connection for this thread and db_name
+        connection = create_connection(db_name) # Pass the db_name here
+        thread_local.connections[connection_key] = connection
+        logging.debug(f"Created new database connection for thread {thread_id} to {db_name}")
+    
+    return thread_local.connections[connection_key]
+
+def close_thread_connections(db_name: str = DEFAULT_DB_NAME): # Add db_name argument
+    """Close all database connections for the current thread for a specific DB."""
     if hasattr(thread_local, "connections"):
         thread_id = threading.get_ident()
-        if thread_id in thread_local.connections and thread_local.connections[thread_id] is not None:
+        connection_key = (thread_id, db_name) # Use the same key structure
+        if connection_key in thread_local.connections and thread_local.connections[connection_key] is not None:
             try:
-                thread_local.connections[thread_id].close()
-                thread_local.connections[thread_id] = None
-                logging.debug(f"Closed database connection for thread {thread_id}")
+                thread_local.connections[connection_key].close()
+                thread_local.connections[connection_key] = None
+                logging.debug(f"Closed database connection for thread {thread_id} to {db_name}")
             except Exception as e:
-                logging.warning(f"Error closing thread-local connection: {e}")
+                logging.warning(f"Error closing thread-local connection to {db_name}: {e}")
 
 def get_videos_for_summarization_from_db(conn: sqlite3.Connection, limit: int = None, job_name: Optional[str] = None) -> List[Dict]:
     """Get videos ready for summarization, from either subtitles or transcriptions."""
@@ -209,11 +219,12 @@ def initialize_gemini_api(api_key: str) -> None:
 
 def summarize_transcript(
     video_info: Dict,
-    api_key: str
+    api_key: str,
+    db_name: str = DEFAULT_DB_NAME # Add db_name argument
 ) -> Dict:
     """Summarize a single transcript using Gemini."""
     # Create a thread-local database connection
-    conn = get_db_connection()
+    conn = get_db_connection(db_name) # Pass db_name
     
     video_db_id = video_info['video_db_id']
     youtube_video_id = video_info['youtube_video_id'] 
@@ -283,21 +294,20 @@ def summarize_transcript(
             initialize_gemini_api(api_key)
             
             # Create prompt for summarization
-            prompt = f"""
-You are an expert linguist and religious content analyst.
+            prompt = f"""You are an expert linguist and religious content analyst.
 
 TASK
-Summarize the following Arabic transcript of a TV show with multiple hosts.
-The video title is: "{video_title}"
+Exclusively in English without retaining any Arabic terms, fully explain what is said about the following themes in the transcript. If there is nothing about a theme, exclude the bulletpoint. Prioritise cases in which the words are explicitly mentioned, but indirect mentions are okay too.
+Themes:Jihad, martyrdom, resistance, conquest, fighters, armed struggle, mujahideen, Hamas, caliphate, unbelievers, apostates, non-Muslims, Westerners, Jews, Zionist, Holocaust, Lobbying.
+If one of the themes is present, then always provide a complete explanation of the way in which it is mentioned. EVERY time a quote is picked out, explain the context in which it is being used. If a theme is not present, leave it out. Only if none of the themes are mentioned then say that none of the themes have been mentioned.
+Focus mainly on direct mention of these words or themes, although indirect mentions are also okay.
+
 
 TRANSCRIPT:
 {transcript_content}
 
-Please provide a concise English summary of this content in under 200 words. Focus on the main themes, arguments, and significant points made on the show. For any particularly controversial statements, include a timestamp and then a guess at who might be speaking. If it's not clear, don't guess and only include the timestamp. 
+Your response should be the themes AND their full explanations. Do not include any markdown formatting. Your response should be only in English and any Arabic terms should be translated and explained."""
 
-Your response should be ONLY the plain text summary with no additional formatting, headings, or explanations.
-If the transcript is empty, unclear, or doesn't contain enough content to summarize, simply state that briefly.
-"""
             
             # Create Gemini model client
             model = genai.GenerativeModel('gemini-2.0-flash')
@@ -426,19 +436,20 @@ If the transcript is empty, unclear, or doesn't contain enough content to summar
         return result
     finally:
         # Close the thread-local connection
-        close_thread_connections()
+        close_thread_connections(db_name) # Pass db_name
 
 def process_transcripts_for_summarization(
     max_workers: int = DEFAULT_MAX_WORKERS,
     api_key: str = None,
-    max_videos: int = None
+    max_videos: int = None,
+    db_name: str = DEFAULT_DB_NAME # Add db_name argument
 ) -> None:
     """Process transcripts individually for summarization using parallel workers."""
     if not api_key:
         api_key = GEMINI_API_KEY
         
     # Get database connection for main thread
-    conn = get_db_connection()
+    conn = get_db_connection(db_name) # Pass db_name
     
     # Get all transcripts that need summarization
     transcripts_to_process = get_videos_for_summarization_from_db(conn, limit=max_videos)
@@ -446,7 +457,7 @@ def process_transcripts_for_summarization(
     
     if not transcripts_to_process:
         logging.info("No transcripts to summarize")
-        close_thread_connections()
+        close_thread_connections(db_name)
         return
     
     # Create thread pool for parallel processing
@@ -457,7 +468,7 @@ def process_transcripts_for_summarization(
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Submit summarization jobs for each transcript individually
         future_to_transcript = {
-            executor.submit(summarize_transcript, transcript_info, api_key): 
+            executor.submit(summarize_transcript, transcript_info, api_key, db_name): # Pass db_name
             transcript_info for transcript_info in transcripts_to_process
         }
         
@@ -488,7 +499,7 @@ def process_transcripts_for_summarization(
                 logging.error(f"Exception processing video {video_db_id}: {e}", exc_info=True)
     
     # Close the main thread's connection
-    close_thread_connections()
+    close_thread_connections(db_name) # Pass db_name
     logging.info(f"Summarization complete. Processed {total_processed} transcripts. Success: {successful_summaries} | Failed: {failed_summaries}")
 
 def main():
@@ -510,6 +521,11 @@ def main():
         default=None,
         help="Maximum number of videos to process in this run"
     )
+    parser.add_argument(
+        "--db-name",
+        default=DEFAULT_DB_NAME,
+        help=f"Name of the SQLite database file to use. Default: {DEFAULT_DB_NAME}"
+    )
     args = parser.parse_args()
     
     logging.info(f"Starting Transcript Summarization at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -525,7 +541,8 @@ def main():
         process_transcripts_for_summarization(
             max_workers=args.max_workers,
             api_key=api_key,
-            max_videos=args.max_videos
+            max_videos=args.max_videos,
+            db_name=args.db_name # Pass db_name from args
         )
     except Exception as e:
         logging.critical(f"Critical error in main process: {e}", exc_info=True)

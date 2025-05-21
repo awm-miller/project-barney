@@ -9,11 +9,11 @@ import re # Added for SRT parsing
 # Load environment variables from .env file
 load_dotenv()
 
-DATABASE_NAME = "pipeline_database.db"
+DEFAULT_DB_NAME = "pipeline_database.db"
 DEFAULT_PLAIN_TEXT_SUBTITLE_DIR = os.getenv("PLAIN_TEXT_SUBTITLE_DIR", "plain_text_subtitles")
 SCRIPT_NAME = "convert_subtitle_to_text.py"
 
-def create_connection(db_file=DATABASE_NAME):
+def create_connection(db_file=DEFAULT_DB_NAME):
     conn = None
     try:
         conn = sqlite3.connect(db_file)
@@ -161,13 +161,18 @@ def main():
                         help=f"Directory to save plain text subtitle files. Default: ./{DEFAULT_PLAIN_TEXT_SUBTITLE_DIR}")
     parser.add_argument("--job-name", type=str, default=None,
                         help="Optional job name to operate on a specific table (e.g., videos_my_job).")
+    parser.add_argument(
+        "--db-name", 
+        default=DEFAULT_DB_NAME, 
+        help=f"Name of the SQLite database file to use. Default: {DEFAULT_DB_NAME}"
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    conn = create_connection(DATABASE_NAME)
+    conn = create_connection(args.db_name)
     if not conn:
-        print("Failed to connect to the database. Exiting.")
+        print(f"Failed to connect to the database '{args.db_name}'. Exiting.")
         return
 
     videos_to_process = get_videos_for_conversion(conn, args.limit, args.job_name)

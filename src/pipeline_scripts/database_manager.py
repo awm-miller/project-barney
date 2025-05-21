@@ -4,8 +4,9 @@ import argparse
 from typing import Optional
 
 DATABASE_NAME = "pipeline_database.db"
+DEFAULT_DB_NAME = DATABASE_NAME # For broader use
 
-def create_connection(db_file=DATABASE_NAME):
+def create_connection(db_file=DEFAULT_DB_NAME):
     """ Create a database connection to a SQLite database """
     conn = None
     try:
@@ -73,7 +74,7 @@ def create_videos_table(conn):
         analysis_error_message TEXT,
         ai_analysis_path TEXT,
         ai_analysis_content TEXT,
-        
+        description TEXT,
         last_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """
@@ -103,7 +104,8 @@ def create_videos_table(conn):
             ("subtitle_to_text_status", "TEXT DEFAULT 'pending'"),
             ("subtitle_to_text_initiated_at", "TIMESTAMP"),
             ("subtitle_to_text_completed_at", "TIMESTAMP"),
-            ("subtitle_to_text_error_message", "TEXT")
+            ("subtitle_to_text_error_message", "TEXT"),
+            ("description", "TEXT")
         ]
 
         for col_name, col_type in columns_to_add:
@@ -459,9 +461,10 @@ def reset_videos_for_reprocessing(conn):
         print(f"Error resetting videos for reprocessing: {e}")
         conn.rollback()
 
-def initialize_database():
+def initialize_database(db_to_init=DEFAULT_DB_NAME):
     """Initialize the database with all required tables and indexes."""
-    conn = create_connection(DATABASE_NAME)
+    # Use the provided db_name or default if called directly
+    conn = create_connection(db_to_init)
     if conn is not None:
         create_videos_table(conn)
         create_channels_table(conn)
@@ -470,6 +473,29 @@ def initialize_database():
         conn.close()
     else:
         print("Error! Cannot create the database connection.")
+
+def reset_summarization_status(conn):
+    """ Resets summarization-related fields for all videos in the database. """
+    sql_update_videos = """
+    UPDATE videos
+    SET analysis_status = 'pending',
+        analysis_initiated_at = NULL,
+        analysis_completed_at = NULL,
+        analysis_error_message = NULL,
+        ai_analysis_content = NULL,
+        ai_analysis_path = NULL,
+        last_updated_at = CURRENT_TIMESTAMP;
+    """
+    try:
+        cursor = conn.cursor()
+        cursor.execute(sql_update_videos)
+        updated_rows = cursor.rowcount
+        print(f"Reset summarization status for {updated_rows} videos.")
+        conn.commit()
+        print("Video summarization statuses reset successfully.")
+    except Error as e:
+        print(f"Error resetting video summarization statuses: {e}")
+        conn.rollback()
 
 def main():
     parser = argparse.ArgumentParser(description="Manage the SQLite database for the pipeline.")
@@ -482,15 +508,24 @@ def main():
     parser.add_argument("--delete-before-date", type=str, help="Delete videos published before this date (YYYY-MM-DD).")
     parser.add_argument("--reset-downloads", action="store_true", help="Reset download status for all videos.")
     parser.add_argument("--reinitialize-soft", action="store_true", help="Resets all video processing statuses, keeping video_id, channel_id etc., to allow reprocessing.")
+    parser.add_argument("--reset-summarization", action="store_true", help="Reset AI summarization status for all videos.")
+    parser.add_argument(
+        "--db-name", 
+        default=DEFAULT_DB_NAME, 
+        help=f"Name of the SQLite database file to use for operations. Default: {DEFAULT_DB_NAME}"
+    )
 
     args = parser.parse_args()
-    connection = create_connection()
+    
+    # Use the db_name from args for creating the connection for operations
+    print(f"Operating on database: {args.db_name}")
+    connection = create_connection(args.db_name)
 
     if connection is not None:
         action_taken = False
         if args.initialize:
             print("Initializing database...")
-            initialize_database() # Manages its own connection internally
+            initialize_database(args.db_name) # Manages its own connection internally
             action_taken = True
         
         if args.reset_stuck_downloads: # Changed to 'if' to allow multiple reset types if desired, or keep as 'elif' if mutually exclusive
@@ -516,10 +551,15 @@ def main():
             reset_videos_for_reprocessing(connection)
             action_taken = True
 
+        if args.reset_summarization:
+            print("Resetting AI summarization statuses...")
+            reset_summarization_status(connection)
+            action_taken = True
+
         if not action_taken:
             # Default behavior: standard setup/check (which `initialize_database` implicitly does via `CREATE TABLE IF NOT EXISTS`)
             print("No specific action requested. Performing standard database setup/check...")
-            initialize_database() # Ensures tables are checked/created if no other action. Manages its own connection.
+            initialize_database(args.db_name) # Ensures tables are checked/created if no other action. Manages its own connection.
                                   # If initialize_database() is meant to use the 'connection' object, it should be:
                                   # create_videos_table(connection)
                                   # create_channels_table(connection)

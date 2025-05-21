@@ -18,12 +18,12 @@ if sys.stderr.encoding != 'utf-8':
 # Load environment variables from .env file
 load_dotenv()
 
-DATABASE_NAME = "pipeline_database.db"
+DEFAULT_DB_NAME = "pipeline_database.db"
 # DEFAULT_SUBTITLE_DIR = os.getenv("SUBTITLE_DIR", "subtitles") # We'll need to define SUBTITLE_DIR in .env or use a default
 DEFAULT_SUBTITLE_DIR = "subtitles"
 
 
-def create_connection(db_file=DATABASE_NAME):
+def create_connection(db_file=DEFAULT_DB_NAME):
     """ Create a database connection to a SQLite database """
     conn = None
     try:
@@ -207,6 +207,11 @@ def main():
                         help="Optional job name to operate on a specific table (e.g., videos_my_job).")
     parser.add_argument("--workers", type=int, default=4,
                         help="Number of parallel workers for fetching subtitles. Default: 4")
+    parser.add_argument(
+        "--db-name", 
+        default=DEFAULT_DB_NAME, 
+        help=f"Name of the SQLite database file to use. Default: {DEFAULT_DB_NAME}"
+    )
 
     args = parser.parse_args()
 
@@ -222,9 +227,9 @@ def main():
             print(f"Error: Could not create subtitle directory {args.subtitle_dir}: {e}")
             return
 
-    conn = create_connection(DATABASE_NAME)
+    conn = create_connection(args.db_name)
     if not conn:
-        print("Failed to connect to the database. Exiting.")
+        print(f"Failed to connect to the database '{args.db_name}'. Exiting.")
         return
 
     videos_to_process_initial_list = get_videos_to_fetch_subtitles(conn, args.limit, args.job_name)
