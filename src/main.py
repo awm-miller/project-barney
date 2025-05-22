@@ -12,6 +12,7 @@ try:
     from pipeline_scripts.db_info_utils import get_database_summary
     # PROMPTS will be defined directly in this file now
     from pipeline_scripts.batch_ai_analyzer import run_batch_analysis
+    from pipeline_scripts.playlist_processor import process_playlist
 except ImportError as e:
     # This is a fallback for local development if PYTHONPATH is not set up
     # For packaging, the relative import should work if structure is src/main.py, src/pipeline_scripts/
@@ -38,7 +39,12 @@ APP_NAME = "C-Beam"
 PROJECT_ROOT = Path(__file__).parent.parent # Assumes src/main.py, so parent.parent is project root
 DATABASES_DIR = PROJECT_ROOT / "databases"
 APP_DATA_DIR = PROJECT_ROOT / "app_data"
+# Define SUBTITLES_BASE_DIR for playlist processor (can be within APP_DATA_DIR or DATABASES_DIR)
+# Let's place it inside DATABASES_DIR, organized by DB name
+SUBTITLES_BASE_DIR_PARENT = DATABASES_DIR # Or APP_DATA_DIR / "subtitle_cache"
+
 KNOWN_DATABASES_FILE = APP_DATA_DIR / "known_databases.txt"
+LAST_OPENED_DB_FILE = APP_DATA_DIR / "last_opened_db.txt" # For storing last opened DB
 
 # Ensure directories exist
 DATABASES_DIR.mkdir(parents=True, exist_ok=True)
@@ -56,6 +62,10 @@ available_databases_column_ref = ft.Ref[ft.Column]()
 current_db_page_ref = ft.Ref[int]()
 total_db_videos_ref = ft.Ref[int]()
 db_page_size_ref = ft.Ref[int]() # To store page size, e.g., 10
+
+# --- Refs for View Database Sorting ---
+sort_column_ref = ft.Ref[Optional[str]]() # Stores column name like 'title' or 'published_at'
+sort_ascending_ref = ft.Ref[bool]()      # True for ASC, False for DESC
 
 # GEMINI_API_KEY retrieval for now, or plan to move to settings
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -129,23 +139,34 @@ def update_active_db_display(db_path: Path | None):
     """Updates the database display Chip."""
     if active_db_chip_ref.current: 
         db_chip = active_db_chip_ref.current
-        # Instead of None, use an empty Text control for the label
-        if not isinstance(db_chip.label, ft.Text) or db_chip.label.value != "":
-            db_chip.label = ft.Text("") 
-
+        
         if db_path: 
             db_display_name = db_path.stem 
-            db_chip.leading = ft.Icon(name="storage", color="primary", size=18) # Slightly larger icon
+            db_chip.leading = ft.Icon(name="storage", color="primary", size=18)
+            # Ensure label is a Text control and set its value
+            if not isinstance(db_chip.label, ft.Text):
+                db_chip.label = ft.Text(db_display_name, size=12, overflow=ft.TextOverflow.ELLIPSIS, no_wrap=True)
+            else:
+                db_chip.label.value = db_display_name
+                db_chip.label.size = 12
+                db_chip.label.overflow = ft.TextOverflow.ELLIPSIS
+                db_chip.label.no_wrap = True
+            
             db_chip.tooltip = f"Active database: {db_display_name}"
         else: # No DB Path
             db_chip.leading = ft.Row(
                 [
-                    ft.Icon(name="storage_outlined", opacity=0.7, size=18), # Slightly larger icon
-                    ft.Icon(name="cancel_outlined", color="error", size=18, tooltip="No database selected") # Slightly larger icon
+                    ft.Icon(name="storage_outlined", opacity=0.7, size=18), 
+                    ft.Icon(name="cancel_outlined", color="error", size=18, tooltip="No database selected")
                 ], 
                 spacing=4, 
                 vertical_alignment=ft.CrossAxisAlignment.CENTER
             )
+            # Ensure label is an empty Text control when no DB is active
+            if not isinstance(db_chip.label, ft.Text):
+                db_chip.label = ft.Text("")
+            else:
+                db_chip.label.value = ""
             db_chip.tooltip = "No database active"
         
         db_chip.visible = True 
@@ -156,6 +177,7 @@ def open_database(db_path_str: str, page: ft.Page):
     if page_ref.current and hasattr(page_ref.current, 'active_db_path'):
         page_ref.current.active_db_path = db_path
         update_active_db_display(db_path)
+        save_last_opened_db(db_path) # Save on successful open
         
         page.snack_bar = ft.SnackBar(ft.Text(f"Opened database: {db_path.name}"), open=True)
         page.update()
@@ -176,9 +198,12 @@ def check_active_db_and_show_snackbar(page: ft.Page) -> bool:
         return False
     return True
 
-# --- Placeholder for fetching video data for View Database page ---
-def fetch_videos_for_view(db_path_str: str, search_term: Optional[str] = None, page_number: int = 1, page_size: int = 10) -> Dict:
-    """ Fetches paginated video data from the database. """
+# --- Function for fetching video data for View Database page ---
+def fetch_videos_for_view(db_path_str: str, search_term: Optional[str] = None, 
+                          page_number: int = 1, page_size: int = 10, 
+                          sort_by: Optional[str] = 'last_updated_at', # Default sort column
+                          sort_direction: str = 'DESC') -> Dict: # Default sort direction
+    """ Fetches paginated and sorted video data from the database. """
     videos = []
     total_count = 0
     conn = None
@@ -192,7 +217,8 @@ def fetch_videos_for_view(db_path_str: str, search_term: Optional[str] = None, p
             "id", "video_id", "title", "channel_id", "published_at", "status",
             "subtitle_status", "download_status", "transcription_status",
             "segmentation_10w_status", "analysis_status", "text_source",
-            "ai_analysis_content", # Keep for details dialog
+            "ai_analysis_content", 
+            "subtitle_file_path", # Corrected column name
             "last_updated_at"
         ]
         select_cols_str = ', '.join(columns_to_select)
@@ -220,7 +246,16 @@ def fetch_videos_for_view(db_path_str: str, search_term: Optional[str] = None, p
 
         # Now fetch the paginated data
         offset = (page_number - 1) * page_size
-        paginated_query_str = f"SELECT {select_cols_str} {base_query} ORDER BY last_updated_at DESC LIMIT ? OFFSET ?"
+        
+        # Validate sort_by to prevent SQL injection if it were user-provided directly
+        # Here, we control it internally, but good practice for future changes.
+        allowed_sort_columns = ["title", "published_at", "last_updated_at", "video_id", "channel_id"]
+        if sort_by not in allowed_sort_columns:
+            sort_by = 'last_updated_at' # Default to a safe column
+        if sort_direction.upper() not in ['ASC', 'DESC']:
+            sort_direction = 'DESC' # Default to a safe direction
+
+        paginated_query_str = f"SELECT {select_cols_str} {base_query} ORDER BY {sort_by} {sort_direction} LIMIT ? OFFSET ?"
         
         # Parameters for paginated query: search terms (if any) + limit + offset
         paginated_params = params + [page_size, offset]
@@ -246,60 +281,123 @@ def fetch_videos_for_view(db_path_str: str, search_term: Optional[str] = None, p
 
 # --- Placeholder for showing video details dialog ---
 def show_video_details_dialog(page: ft.Page, video_data: Dict):
-    """ Placeholder: Shows a dialog with AI analysis and transcript. """
+    """ Shows video details, using ft.AlertDialog via page.overlay. """
+    print(f"DEBUG: show_video_details_dialog (AlertDialog via overlay) for: {video_data.get('video_id', 'N/A')}")
     
-    transcript_content_text = "Could not load transcript."
-    # In a real implementation, load transcript from video_data['source_text_path']
-    # For example:
-    # try:
-    #     with open(video_data.get('source_text_path', ''), 'r', encoding='utf-8') as f:
-    #         transcript_content_text = f.read()
-    # except Exception as e:
-    #     transcript_content_text = f"Error loading transcript: {e}"
-    # For this placeholder, we'll use a fixed string
-    if video_data.get('source_text_path'): # simulate having a path
-        transcript_content_text = "This is a placeholder for the full transcript content that would be scrollable. Timestamps would appear here if available in the source file."
+    dialog_instance_ref = ft.Ref[ft.AlertDialog]()
+
+    def close_the_alert_dialog(e):
+        print(f"DEBUG: close_the_alert_dialog called. Dialog ref: {dialog_instance_ref.current}")
+        if dialog_instance_ref.current:
+            print(f"DEBUG: Dialog open state BEFORE close: {dialog_instance_ref.current.open}")
+            dialog_instance_ref.current.open = False
+            print(f"DEBUG: Dialog open state AFTER setting to False: {dialog_instance_ref.current.open}")
+            
+            # Ensure page updates to hide the dialog
+            page.update()
+            print(f"DEBUG: page.update() called in close_the_alert_dialog.")
+
+            # Optional: Clean up from overlay after it's hidden
+            # This might require another page.update() if done here.
+            # For now, let's ensure it hides first.
+            # if dialog_instance_ref.current in page.overlay:
+            #     print(f"DEBUG: Removing dialog from overlay.")
+            #     page.overlay.remove(dialog_instance_ref.current)
+            #     page.update() # Update again after removal
+
+    # Original dialog content restoration
+    transcript_content_text = "Transcript not available."
+    subtitle_path_str = video_data.get('subtitle_file_path')
+
+    if subtitle_path_str:
+        try:
+            subtitle_path = Path(subtitle_path_str)
+            if subtitle_path.is_file():
+                with open(subtitle_path, 'r', encoding='utf-8') as f:
+                    transcript_content_text = f.read()
+                if not transcript_content_text.strip():
+                    transcript_content_text = "Transcript file is empty."
+            else:
+                transcript_content_text = f"Transcript file not found at: {subtitle_path_str}"
+        except Exception as e:
+            transcript_content_text = f"Error loading transcript: {e}"
+            print(f"Error reading subtitle file {subtitle_path_str}: {e}")
     else:
-        # This case will now be hit more often if source_text_path is not in the DB
-        transcript_content_text = "Transcript path not available or column removed from query."
+        transcript_content_text = "No transcript path provided in database."
 
-    dialog_content = ft.Column(
+    # Create ExpansionPanels for AI Analysis and Transcript
+    ai_analysis_panel = ft.ExpansionPanel(
+        header=ft.Container(ft.Text("AI Analysis", style=ft.TextThemeStyle.TITLE_MEDIUM), padding=ft.padding.only(left=10, top=5, bottom=5)),
+        content=ft.Container(
+            ft.Text(video_data.get('ai_analysis_content', 'No AI analysis available.'), selectable=True),
+            padding=ft.padding.all(10)
+        ),
+        # expanded=True # Optionally start expanded
+    )
+
+    transcript_panel = ft.ExpansionPanel(
+        header=ft.Container(ft.Text("Transcript", style=ft.TextThemeStyle.TITLE_MEDIUM), padding=ft.padding.only(left=10, top=5, bottom=5)),
+        content=ft.Container(
+            ft.Text(transcript_content_text, selectable=True),
+            padding=ft.padding.all(10),
+            height=150, # Keep scrollable height if content is long
+        ),
+        # expanded=True
+    )
+
+    dialog_content_column = ft.Column(
         [
-            ft.Text(f"Details for: {video_data.get('title', 'N/A')}", style=ft.TextThemeStyle.HEADLINE_SMALL, weight=ft.FontWeight.BOLD),
-            ft.Text("AI Analysis:", style=ft.TextThemeStyle.TITLE_MEDIUM),
-            ft.Container(
-                ft.Text(video_data.get('ai_analysis_content', 'No AI analysis available.'), selectable=True),
-                border=ft.border.all(1, "grey"), padding=10, border_radius=5, margin=ft.margin.only(bottom=10)
-            ),
-            ft.Text("Transcript:", style=ft.TextThemeStyle.TITLE_MEDIUM),
-            ft.Container(
-                ft.Text(transcript_content_text, selectable=True),
-                border=ft.border.all(1, "grey"), padding=10, border_radius=5, 
-                height=200, # Make transcript area scrollable
-                scroll=ft.ScrollMode.ADAPTIVE
-            ),
+            ft.ExpansionPanelList(
+                controls=[
+                    ai_analysis_panel,
+                    transcript_panel
+                ],
+                elevation=1, # Optional: add a slight shadow
+                divider_color="outlinevariant" # Corrected: string literal for Material 3 color role
+            )
         ],
-        tight=True, # Make column take minimum space needed by its content
-        width=600, # Define a width for the dialog content
-        scroll=ft.ScrollMode.ADAPTIVE # Allow overall dialog content to scroll if very long
+        tight=True, 
+        width=600, 
+        scroll=ft.ScrollMode.ADAPTIVE 
     )
+    # End of original dialog content restoration
 
-    dialog = ft.AlertDialog(
+    alert_dialog = ft.AlertDialog(
+        ref=dialog_instance_ref, 
         modal=True,
-        title=ft.Text("Video Details"),
-        content=dialog_content,
-        actions=[
-            ft.TextButton("Close", on_click=lambda _: close_dialog(page, dialog)),
-        ],
+        title=ft.Row(
+            [
+                ft.Text(video_data.get('title', 'Video Details'), weight=ft.FontWeight.BOLD, expand=True, overflow=ft.TextOverflow.ELLIPSIS, max_lines=2),
+                ft.IconButton("close", on_click=close_the_alert_dialog, tooltip="Close dialog")
+            ],
+            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER
+        ),
+        content=dialog_content_column, 
+        shape=ft.RoundedRectangleBorder(radius=10), 
+        actions=None, # Removed actions, close button is in the title now
         actions_alignment=ft.MainAxisAlignment.END,
+        open=False 
     )
-    page.dialog = dialog
-    dialog.open = True
+    
+    # Add to overlay if not already there (e.g., if reusing instances was a concept)
+    # For a new dialog each time, just append.
+    if alert_dialog not in page.overlay:
+        page.overlay.append(alert_dialog)
+    # page.update() # Update to add to overlay, might not be strictly needed before open
+
+    alert_dialog.open = True
     page.update()
 
-def close_dialog(page, dialog_instance):
-    dialog_instance.open = False
-    page.update()
+    print(f"DEBUG: AlertDialog added to overlay and opened. Open state: {alert_dialog.open}")
+
+# The close_dialog function is for AlertDialog, not strictly needed for BottomSheet if using page.close_bottom_sheet()
+# but we can keep it if we plan to reuse/revert
+def close_dialog(page, dialog_instance): # This is for AlertDialog
+    if isinstance(dialog_instance, ft.AlertDialog):
+        dialog_instance.open = False
+        page.update()
+    # For BottomSheet, page.close_bottom_sheet() is preferred.
 
 # --- View Builder Functions ---
 
@@ -382,58 +480,310 @@ def build_home_view(page: ft.Page):
     )
 
 def build_create_new_db_view(page: ft.Page):
-    db_name_field = ft.TextField(label="New Database Name (e.g., 'tech_channels')", width=300)
+    db_name_field = ft.TextField(
+        label="New Database Name (e.g., 'tech_channels')", 
+        width=350, # Increased width slightly
+        border=ft.InputBorder.OUTLINE,
+        border_radius=8,
+        # hint_text="Enter a name for your new database collection."
+    )
+    create_db_view_content_ref = ft.Ref[ft.Column]()
 
     def create_db_action(e):
+        print("DEBUG: create_db_action started.")
         db_name_raw = db_name_field.value
         if not db_name_raw:
             page.snack_bar = ft.SnackBar(ft.Text("Database name cannot be empty."), open=True, bgcolor="errorcontainer")
             page.update()
+            print("DEBUG: create_db_action exited - empty name.")
             return
 
-        # Sanitize name (simple sanitization)
-        db_name = "".join(c if c.isalnum() or c in ('_', '-') else '_' for c in db_name_raw)
-        if not db_name: # if sanitization results in empty string
-             page.snack_bar = ft.SnackBar(ft.Text("Invalid characters in database name."), open=True, bgcolor="errorcontainer")
+        db_name_sanitized = "".join(c if c.isalnum() or c in ('_', '-') else '_' for c in db_name_raw)
+        if not db_name_sanitized:
+             page.snack_bar = ft.SnackBar(ft.Text("Invalid characters in database name. Use alphanumeric, underscore, or hyphen."), open=True, bgcolor="errorcontainer")
              page.update()
+             print("DEBUG: create_db_action exited - invalid sanitized name.")
              return
 
-        if not db_name.endswith(".db"):
-            db_name += ".db"
+        if not db_name_sanitized.endswith(".db"):
+            db_filename = db_name_sanitized + ".db"
+        else:
+            db_filename = db_name_sanitized
         
-        new_db_path = DATABASES_DIR / db_name
+        new_db_path = DATABASES_DIR / db_filename
 
         if new_db_path.exists():
-            page.snack_bar = ft.SnackBar(ft.Text(f"Database '{db_name}' already exists."), open=True, bgcolor="warningcontainer")
+            page.snack_bar = ft.SnackBar(ft.Text(f"Database '{db_filename}' already exists."), open=True, bgcolor="warningcontainer")
             page.update()
+            print(f"DEBUG: create_db_action exited - DB '{db_filename}' already exists.")
             return
 
         try:
-            conn = sqlite3.connect(new_db_path)
+            print(f"DEBUG: Attempting to create and initialize DB: {new_db_path}")
+            conn = sqlite3.connect(new_db_path) 
+            try:
+                from pipeline_scripts.database_manager import initialize_database
+                initialize_database(str(new_db_path))
+                print(f"DEBUG: Database {new_db_path} initialized with tables via initialize_database.")
+            except ImportError as init_ex:
+                print(f"WARNING: Could not import initialize_database ({init_ex}). Manually creating 'videos' table for {new_db_path}")
+                cursor = conn.cursor()
+                cursor.execute('''
+                CREATE TABLE IF NOT EXISTS videos (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, video_id TEXT UNIQUE NOT NULL, video_url TEXT, 
+                    channel_id TEXT, title TEXT, published_at TIMESTAMP,
+                    subtitle_status TEXT, subtitle_file_path TEXT, plain_text_subtitle_path TEXT,
+                    subtitle_fetched_at TIMESTAMP, subtitle_to_text_status TEXT, subtitle_to_text_completed_at TIMESTAMP,
+                    source_script TEXT, status TEXT, last_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                ''')
+                conn.commit()
+                print(f"DEBUG: Manually created minimal 'videos' table for {new_db_path}.")
             conn.close()
+            print(f"DEBUG: DB file {new_db_path} created and connection closed.")
             
             add_known_database(new_db_path, page)
+            print(f"DEBUG: DB {new_db_path} added to known databases.")
             open_database(str(new_db_path), page) 
-            page.snack_bar = ft.SnackBar(ft.Text(f"Database '{db_name}' created and opened."), open=True)
-            page.update()
+            print(f"DEBUG: DB {new_db_path} opened.")
+            
+            page.snack_bar = ft.SnackBar(ft.Text(f"Database '{db_filename}' created. Now choose how to populate it."), open=True)
             db_name_field.value = "" 
-            db_name_field.update()
-            if hasattr(page, 'switch_view_callback'):
-                page.switch_view_callback(0) 
+            # db_name_field.update() # No need to update field if the whole view is changing
+            
+            print("DEBUG: Attempting to transition to Choose Import Method view.")
+            if main_content_area_ref.current:
+                print("DEBUG: main_content_area_ref.current is available.")
+                main_content_area_ref.current.controls.clear()
+                main_content_area_ref.current.controls.append(build_choose_import_method_view(page, new_db_path))
+                main_content_area_ref.current.update()
+                page.update() # Ensure page updates after content area manipulation
+                print("DEBUG: Switched to Choose Import Method view.")
+            else:
+                print("ERROR: main_content_area_ref.current is NOT available. Cannot switch view.")
+                if hasattr(page, 'switch_view_callback'):
+                    print("DEBUG: Fallback - switching to home view (index 0).")
+                    page.switch_view_callback(0) 
+                page.update() # Update page even in fallback
 
         except Exception as ex:
             page.snack_bar = ft.SnackBar(ft.Text(f"Error creating database: {ex}"), open=True, bgcolor="errorcontainer")
             page.update()
+            print(f"ERROR: Exception in create_db_action: {ex}")
 
-    return ft.Column(
-        [
-            ft.Text("Create New Database", theme_style=ft.TextThemeStyle.HEADLINE_MEDIUM),
+    create_db_view_column = ft.Column(
+        ref=create_db_view_content_ref,
+        controls=[
+            ft.Text("Create New Database - Step 1: Name", theme_style=ft.TextThemeStyle.HEADLINE_MEDIUM),
             ft.Text(f"Databases will be saved in: {DATABASES_DIR.resolve()}"),
             db_name_field,
-            ft.ElevatedButton("Create Database", icon="create_new_folder", on_click=create_db_action)
+            ft.ElevatedButton("Next: Choose Import Method", icon="arrow_forward", on_click=create_db_action)
         ],
         spacing=20,
         horizontal_alignment=ft.CrossAxisAlignment.CENTER
+    )
+    return create_db_view_column
+
+def build_choose_import_method_view(page: ft.Page, db_path: Path):
+    """Builds the view for choosing how to populate the new database."""
+    
+    def go_to_playlist_import(e):
+        if main_content_area_ref.current:
+            main_content_area_ref.current.controls.clear()
+            main_content_area_ref.current.controls.append(build_add_by_playlist_view(page, db_path))
+            main_content_area_ref.current.update()
+
+    def go_to_date_import(e): # Placeholder
+        page.snack_bar = ft.SnackBar(ft.Text("Import by date (random) is not yet implemented."), open=True)
+        page.update()
+
+    return ft.Column(
+        [
+            ft.Text(f"Populate '{db_path.name}' - Step 2: Choose Import Method", theme_style=ft.TextThemeStyle.HEADLINE_MEDIUM),
+            ft.Text("How would you like to add videos to this new database?"),
+            ft.ElevatedButton("Import from YouTube Playlist", icon="playlist_add", on_click=go_to_playlist_import, width=300),
+            ft.ElevatedButton("Import by Date (Random - Placeholder)", icon="event", on_click=go_to_date_import, width=300, disabled=True), # Disabled for now
+            ft.Divider(height=20),
+            ft.TextButton("Or, skip and manage this database later", on_click=lambda e: page.switch_view_callback(0) if hasattr(page, 'switch_view_callback') else None)
+        ],
+        spacing=20,
+        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+        # alignment=ft.MainAxisAlignment.START, # Let content flow from top
+        expand=True, # Allow this view to expand
+        scroll=ft.ScrollMode.ADAPTIVE # Add scroll to the whole view if needed
+    )
+
+def build_add_by_playlist_view(page: ft.Page, db_path: Path):
+    """Builds the view for adding videos by playlist URL."""
+    playlist_url_field = ft.TextField(label="YouTube Playlist URL", width=500)
+    progress_messages_column = ft.Column(scroll=ft.ScrollMode.ADAPTIVE, height=200, spacing=5) # Area for messages
+    # Overall progress bar for the playlist
+    playlist_progress_bar = ft.ProgressBar(value=0, visible=False, width=page.width*0.8 if page.width else 500)
+    # Text for current video progress
+    current_video_progress_text = ft.Text("", visible=False)
+    start_import_button_ref = ft.Ref[ft.ElevatedButton]()
+
+
+    def playlist_progress_callback(message_type: str, data: dict):
+        # This function is called from the background thread via page.call_soon_threadsafe
+        
+        def _update_ui():
+            nonlocal current_total_videos # Access the variable from the outer scope
+            if message_type == "playlist_start":
+                progress_messages_column.controls.append(ft.Text(f"Starting playlist processing for: {data.get('playlist_url')}"))
+                playlist_progress_bar.visible = True
+                current_video_progress_text.visible = True
+            elif message_type == "error":
+                progress_messages_column.controls.append(ft.Text(f"ERROR: {data.get('message')}", color="error"))
+                if start_import_button_ref.current: start_import_button_ref.current.disabled = False # Re-enable button on error
+            elif message_type == "playlist_fetch_items":
+                progress_messages_column.controls.append(ft.Text(data.get("status", "Fetching playlist items...")))
+            elif message_type == "playlist_fetch_items_success":
+                current_total_videos = data.get("count", 0)
+                progress_messages_column.controls.append(ft.Text(f"Found {current_total_videos} videos in playlist."))
+                if current_total_videos == 0:
+                     if start_import_button_ref.current: start_import_button_ref.current.disabled = False # Re-enable if no videos
+                     playlist_progress_bar.visible = False
+                     current_video_progress_text.visible = False
+
+
+            elif message_type == "total_videos": # Handled by fetch_items_success for current_total_videos
+                pass # current_total_videos is already set
+            
+            elif message_type == "video_processing_start":
+                idx = data.get("index", 0)
+                title = data.get("title", "Unknown video")
+                # Update overall progress bar for playlist
+                if current_total_videos > 0:
+                    playlist_progress_bar.value = (idx + 1) / current_total_videos
+                else:
+                    playlist_progress_bar.value = 0
+                
+                current_video_progress_text.value = f"Processing video {idx+1}/{current_total_videos}: '{title}' (0%)"
+            
+            elif message_type == "video_progress":
+                idx = data.get("index", 0)
+                task = data.get("task", "working...")
+                percentage = data.get("percentage", 0)
+                title = data.get("title", progress_messages_column.controls[-1].value if progress_messages_column.controls else "current video") # try to get title
+                # Try to get title from a previous message if possible, or use a generic term
+                current_video_progress_text.value = f"Video {idx+1}/{current_total_videos}: {task} ({percentage}%)"
+
+            elif message_type == "video_completed":
+                idx = data.get("index", 0)
+                video_id = data.get("video_id", "N/A")
+                details = data.get("details", {})
+                title = details.get("title", video_id)
+                progress_messages_column.controls.append(ft.Text(f"  [OK] Video {idx+1}: '{title}' processed and added to DB.", color="green"))
+                current_video_progress_text.value = f"Video {idx+1}/{current_total_videos}: Completed."
+                if (idx + 1) == current_total_videos: # Last video
+                    playlist_progress_bar.value = 1
+
+            elif message_type == "video_error":
+                idx = data.get("index", 0)
+                video_id = data.get("video_id", "N/A")
+                error_msg = data.get("error", "Unknown error")
+                progress_messages_column.controls.append(ft.Text(f"  [FAIL] Video {idx+1} ({video_id}): {error_msg}", color="error"))
+                current_video_progress_text.value = f"Video {idx+1}/{current_total_videos}: Error."
+                # Overall progress bar still advances as we tried to process it.
+                if current_total_videos > 0:
+                     playlist_progress_bar.value = (idx + 1) / current_total_videos
+
+            elif message_type == "all_completed":
+                total_processed = data.get("total_processed", "N/A")
+                progress_messages_column.controls.append(ft.Text(f"Playlist processing finished. Processed {total_processed} videos.", weight=ft.FontWeight.BOLD))
+                playlist_progress_bar.value = 1
+                current_video_progress_text.value = "All videos processed."
+                if start_import_button_ref.current: start_import_button_ref.current.disabled = False # Re-enable button
+            
+            # Ensure controls are updated on the page
+            progress_messages_column.update()
+            playlist_progress_bar.update()
+            current_video_progress_text.update()
+            if start_import_button_ref.current: start_import_button_ref.current.update()
+            page.update() # General page update to reflect changes
+
+        # Schedule the UI update to run on Flet's main event loop
+        page.call_soon_threadsafe(_update_ui)
+
+    current_total_videos = 0 # Variable to store total videos for progress calculation
+
+    def start_playlist_import_action(e):
+        nonlocal current_total_videos # Allow modification
+        current_total_videos = 0 # Reset for new import
+
+        url = playlist_url_field.value
+        if not url:
+            page.snack_bar = ft.SnackBar(ft.Text("Playlist URL cannot be empty."), open=True, bgcolor="errorcontainer")
+            page.update()
+            return
+
+        # Disable button, clear previous messages
+        if start_import_button_ref.current: start_import_button_ref.current.disabled = True
+        progress_messages_column.controls.clear()
+        progress_messages_column.controls.append(ft.Text(f"Starting import for playlist: {url}"))
+        progress_messages_column.update()
+        playlist_progress_bar.value = 0
+        playlist_progress_bar.visible = True
+        playlist_progress_bar.update()
+        current_video_progress_text.value = "Initializing..."
+        current_video_progress_text.visible = True
+        current_video_progress_text.update()
+        page.update()
+
+        # Define subtitle storage directory based on the DB name
+        # e.g., databases/my_playlist_db_subtitles/
+        db_name_stem = db_path.stem 
+        subtitles_for_this_db_dir = SUBTITLES_BASE_DIR_PARENT / f"{db_name_stem}_subtitles"
+        
+        try:
+            subtitles_for_this_db_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as ex_mkdir:
+            page.snack_bar = ft.SnackBar(ft.Text(f"Error creating subtitle directory: {ex_mkdir}"), open=True, bgcolor="errorcontainer")
+            if start_import_button_ref.current: start_import_button_ref.current.disabled = False
+            page.update()
+            return
+
+        page.run_thread_async(
+            process_playlist,
+            playlist_url=url,
+            db_path=str(db_path),
+            subtitle_base_dir=str(subtitles_for_this_db_dir),
+            progress_callback=playlist_progress_callback
+        )
+
+    return ft.Column(
+        [
+            ft.Text(f"Populate '{db_path.name}' - Step 3: Add by Playlist", theme_style=ft.TextThemeStyle.HEADLINE_MEDIUM),
+            playlist_url_field,
+            ft.ElevatedButton("Start Import", ref=start_import_button_ref, icon="cloud_download", on_click=start_playlist_import_action),
+            ft.Divider(height=15),
+            ft.Text("Overall Playlist Progress:", weight=ft.FontWeight.BOLD),
+            playlist_progress_bar,
+            ft.Text("Current Video Progress:", weight=ft.FontWeight.BOLD, visible=False), # Initially hidden
+            current_video_progress_text, # Displays detailed progress of current video
+            ft.Text("Import Log:", weight=ft.FontWeight.BOLD),
+            ft.Container(
+                content=progress_messages_column,
+                border=ft.border.all(1, "grey"), # Corrected color to string literal
+                border_radius=5,
+                padding=10,
+                expand=True, # Allow it to take available vertical space if Column is expanded
+                height=300 # Fixed height for scrollable area
+            ),
+            ft.TextButton("Back to Import Methods", on_click=lambda e: (
+                main_content_area_ref.current.controls.clear(),
+                main_content_area_ref.current.controls.append(build_choose_import_method_view(page, db_path)),
+                main_content_area_ref.current.update()
+            ) if main_content_area_ref.current else None),
+            ft.TextButton("Finish and go to Home", on_click=lambda e: page.switch_view_callback(0) if hasattr(page, 'switch_view_callback') else None)
+
+        ],
+        spacing=15,
+        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+        # alignment=ft.MainAxisAlignment.START, # Let content flow from top
+        expand=True, # Allow this view to expand
+        scroll=ft.ScrollMode.ADAPTIVE # Add scroll to the whole view if needed
     )
 
 def build_change_database_view(page: ft.Page):
@@ -528,10 +878,12 @@ def build_change_database_view(page: ft.Page):
     return ft.Column(
         [
             ft.Row([
-                ft.Text("Manage Databases", theme_style=ft.TextThemeStyle.HEADLINE_MEDIUM),
-                ft.IconButton("refresh", on_click=lambda e_click: local_trigger_db_list_refresh(), tooltip="Refresh List"),
-                ft.ElevatedButton("Add Existing DB File", icon="add_circle_outline", on_click=add_existing_db_dialog)
-            ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+                ft.Text("Manage Databases", theme_style=ft.TextThemeStyle.HEADLINE_MEDIUM, expand=True), # Title takes available space
+                ft.Row([ # Group for buttons on the right
+                    # ft.IconButton("refresh", on_click=lambda e_click: local_trigger_db_list_refresh(), tooltip="Refresh List"), # Removed refresh button
+                    ft.ElevatedButton("Import", icon="add_circle_outline", on_click=add_existing_db_dialog)
+                ], spacing=5)
+            ], alignment=ft.MainAxisAlignment.START, vertical_alignment=ft.CrossAxisAlignment.CENTER), # Main row alignment
             ft.Text("Select a database to open, or add an existing one to your list."),
             ft.Divider(),
             available_databases_column 
@@ -548,31 +900,18 @@ def build_view_database_view(page: ft.Page):
     
     # Define DataTable columns for the simplified view
     datatable_columns = [
-        # ft.DataColumn(ft.Text("ID"), numeric=True), # No longer shown directly
-        ft.DataColumn(ft.Text("Video ID (Clickable)")),
+        ft.DataColumn(ft.Text("Link")), 
         ft.DataColumn(ft.Text("Title")),
-        # ft.DataColumn(ft.Text("Channel ID")), # No longer shown directly
         ft.DataColumn(ft.Text("Published")), 
-        # ft.DataColumn(ft.Text("Status")), # No longer shown directly
-        # ft.DataColumn(ft.Text("Subtitles")), # No longer shown directly
-        # ft.DataColumn(ft.Text("DL Status")), # No longer shown directly
-        # ft.DataColumn(ft.Text("Transcript")), # No longer shown directly
-        # ft.DataColumn(ft.Text("Segment")), # No longer shown directly
-        # ft.DataColumn(ft.Text("AI Status")), # No longer shown directly
-        # ft.DataColumn(ft.Text("Text Src")), # No longer shown directly
-        # ft.DataColumn(ft.Text("Updated")), # No longer shown directly
-        ft.DataColumn(ft.Text("Actions")),
+        ft.DataColumn(ft.Text("Actions"), numeric=True), # Actions often better numeric for right-align if desired
     ]
 
     data_table = ft.DataTable(
         columns=datatable_columns,
         rows=[],
-        column_spacing=10,
+        column_spacing=20, # Increased spacing a bit
         divider_thickness=0.5,
-        # heading_row_color=ft.colors.SURFACE_VARIANT, # Example styling
-        # border=ft.border.all(1, ft.colors.OUTLINE), # Example styling
-        # border_radius=5, # Example styling
-        expand=True, # Allow table to expand within its container
+        # expand=True, # Removed expand
     )
     
     # Using a Ref for data_table to update its rows
@@ -618,17 +957,47 @@ def build_view_database_view(page: ft.Page):
                     video_id = video_data.get('video_id', 'N/A')
                     video_url = f"https://www.youtube.com/watch?v={video_id}"
                     
+                    youtube_icon = ft.Icon(name="smart_display", color="red", size=20, tooltip="Open YouTube link") # Increased size slightly
+
+                    # Wrap the Icon in a Container to make it clickable
+                    clickable_youtube_icon_container = ft.Container(
+                        content=youtube_icon,
+                        on_click=lambda e, url=video_url: page.launch_url(url),
+                        ink=True, 
+                        border_radius=4,
+                        padding=ft.padding.all(2) # Small padding so click area is decent around icon
+                    )
+
+                    # Format published date
+                    published_at_str = video_data.get('published_at')
+                    formatted_date = "N/A"
+                    if published_at_str:
+                        try:
+                            # Replace Z with +00:00 for fromisoformat if Z is used for UTC
+                            if published_at_str.endswith('Z'):
+                                published_at_str = published_at_str[:-1] + '+00:00'
+                            dt_obj = datetime.fromisoformat(published_at_str)
+                            formatted_date = dt_obj.strftime("%d/%m/%Y")
+                        except ValueError:
+                            # Fallback for simpler "YYYY-MM-DD" or if fromisoformat fails
+                            try:
+                                date_part = published_at_str.split('T')[0].split(' ')[0] 
+                                dt_obj = datetime.strptime(date_part, "%Y-%m-%d")
+                                formatted_date = dt_obj.strftime("%d/%m/%Y")
+                            except ValueError:
+                                formatted_date = published_at_str 
+                                print(f"Could not parse date: {published_at_str}") 
+
                     cells = [
-                        # ft.DataCell(ft.Text(str(video_data.get('id', 'N/A')))), # Removed
-                        ft.DataCell(
-                            ft.Text(video_id, color="lightblue", overflow=ft.TextOverflow.ELLIPSIS), 
-                            on_tap=lambda e, url=video_url: page.launch_url(url) # Corrected: e is passed by on_tap
-                        ),
+                        ft.DataCell(clickable_youtube_icon_container),
                         ft.DataCell(ft.Text(video_data.get('title', 'N/A'), overflow=ft.TextOverflow.ELLIPSIS)),
-                        # ft.DataCell(ft.Text(video_data.get('channel_id', 'N/A'))), # Removed
-                        ft.DataCell(ft.Text(str(video_data.get('published_at', 'N/A')).split(' ')[0] if video_data.get('published_at') else 'N/A')),
-                        # ... other cells removed for brevity ...
-                        ft.DataCell(ft.IconButton(icon="visibility", tooltip="View Details", on_click=lambda _, vd=video_data: show_video_details_dialog(page, vd)))
+                        ft.DataCell(ft.Text(formatted_date)),
+                        ft.DataCell(ft.IconButton(icon="visibility", tooltip="View Details", 
+                                                  on_click=lambda e, vd=video_data: (
+                                                      print(f"DEBUG: Eye icon clicked for video ID: {vd.get('video_id')}"), 
+                                                      show_video_details_dialog(page, vd)
+                                                  )
+                                     ))
                     ]
                     data_table_ref.current.rows.append(ft.DataRow(cells=cells))
             data_table_ref.current.update()
@@ -636,13 +1005,18 @@ def build_view_database_view(page: ft.Page):
         update_pagination_controls()
 
     def _fetch_and_update_page_data(page_num_to_load: int, search_term_val: Optional[str]):
-        if page.active_db_path and current_db_page_ref.current is not None and db_page_size_ref.current is not None:
-            current_db_page_ref.current = page_num_to_load # Update current page before fetching
+        if page.active_db_path and current_db_page_ref.current is not None and db_page_size_ref.current is not None and sort_column_ref.current is not None and sort_ascending_ref.current is not None:
+            current_db_page_ref.current = page_num_to_load 
+            
+            sort_dir_str = 'ASC' if sort_ascending_ref.current else 'DESC'
+
             fetched_data = fetch_videos_for_view(
                 str(page.active_db_path), 
                 search_term_val,
                 page_number=current_db_page_ref.current,
-                page_size=db_page_size_ref.current
+                page_size=db_page_size_ref.current,
+                sort_by=sort_column_ref.current,
+                sort_direction=sort_dir_str
             )
             update_data_table(fetched_data)
         else:
@@ -658,8 +1032,13 @@ def build_view_database_view(page: ft.Page):
     def initial_load():
         if current_db_page_ref.current is None: current_db_page_ref.current = 1
         if db_page_size_ref.current is None: db_page_size_ref.current = 10
-        search_term = search_field.value # Consider if search should persist or clear on view load
-        _fetch_and_update_page_data(1, search_term) # Load page 1
+        # Initialize sort state if not already set by a click or previous load
+        if sort_column_ref.current is None: sort_column_ref.current = 'published_at'
+        if sort_ascending_ref.current is None: sort_ascending_ref.current = False
+        
+        search_term = search_field.value 
+        _fetch_and_update_page_data(1, search_term) 
+        update_column_header_visuals() # Set initial sort indicators
 
     def go_to_next_page(page_instance: ft.Page, current_search_term: Optional[str]):
         if total_db_videos_ref.current is not None and current_db_page_ref.current is not None and db_page_size_ref.current is not None:
@@ -692,25 +1071,110 @@ def build_view_database_view(page: ft.Page):
     # Initialize pagination state Refs
     if current_db_page_ref.current is None: current_db_page_ref.current = 1
     if total_db_videos_ref.current is None: total_db_videos_ref.current = 0
-    if db_page_size_ref.current is None: db_page_size_ref.current = 10 # Default page size
+    if db_page_size_ref.current is None: db_page_size_ref.current = 10
+    if sort_column_ref.current is None: sort_column_ref.current = 'published_at' # Default sort
+    if sort_ascending_ref.current is None: sort_ascending_ref.current = False # Default DESC for dates
+
+    # Refs for column header elements to update sort indicators
+    title_header_text_ref = ft.Ref[ft.Text]()
+    title_header_icon_ref = ft.Ref[ft.Icon]()
+    published_header_text_ref = ft.Ref[ft.Text]()
+    published_header_icon_ref = ft.Ref[ft.Icon]()
+
+    def update_column_header_visuals():
+        # Reset both icons first
+        if title_header_icon_ref.current: 
+            title_header_icon_ref.current.name = "unfold_more" # Default icon (or None/empty string for no icon)
+            title_header_icon_ref.current.visible = False # Or True if using unfold_more
+        if published_header_icon_ref.current:
+            published_header_icon_ref.current.name = "unfold_more"
+            published_header_icon_ref.current.visible = False
+
+        target_icon_ref = None
+        if sort_column_ref.current == 'title':
+            target_icon_ref = title_header_icon_ref
+        elif sort_column_ref.current == 'published_at':
+            target_icon_ref = published_header_icon_ref
+
+        if target_icon_ref and target_icon_ref.current:
+            target_icon_ref.current.name = "arrow_upward" if sort_ascending_ref.current else "arrow_downward"
+            target_icon_ref.current.visible = True
+        
+        if title_header_icon_ref.current: title_header_icon_ref.current.update()
+        if published_header_icon_ref.current: published_header_icon_ref.current.update()
+
+    def handle_sort_click(column_name: str):
+        if sort_column_ref.current == column_name:
+            sort_ascending_ref.current = not sort_ascending_ref.current
+        else:
+            sort_column_ref.current = column_name
+            sort_ascending_ref.current = True if column_name == 'title' else False 
+        
+        current_db_page_ref.current = 1 
+        _fetch_and_update_page_data(current_db_page_ref.current, search_field.value)
+        update_column_header_visuals()
+
+    # Define DataTable columns with interactive labels for sortable columns
+    datatable_columns = [
+        ft.DataColumn(ft.Text("Link")), 
+        ft.DataColumn(
+            ft.Container(
+                content=ft.Row([ 
+                    ft.Text("Title", ref=title_header_text_ref), 
+                    ft.Icon(ref=title_header_icon_ref, size=16, visible=False)
+                ], alignment=ft.MainAxisAlignment.START, spacing=4),
+                on_click=lambda e: handle_sort_click('title'),
+                ink=True, border_radius=4, padding=ft.padding.symmetric(horizontal=4) # Make area clickable
+            )
+        ),
+        ft.DataColumn(
+            ft.Container(
+                content=ft.Row([
+                    ft.Text("Published", ref=published_header_text_ref), 
+                    ft.Icon(ref=published_header_icon_ref, size=16, visible=False)
+                ], alignment=ft.MainAxisAlignment.START, spacing=4),
+                on_click=lambda e: handle_sort_click('published_at'),
+                ink=True, border_radius=4, padding=ft.padding.symmetric(horizontal=4)
+            )
+        ),
+        ft.DataColumn(ft.Text("Actions"), numeric=True),
+    ]
+
+    data_table = ft.DataTable(
+        columns=datatable_columns,
+        rows=[],
+        column_spacing=20, # Increased spacing a bit
+        divider_thickness=0.5,
+        # expand=True, # Removed expand
+    )
+    
+    # Using a Ref for data_table to update its rows
+    data_table_ref = ft.Ref[ft.DataTable]()
+    data_table_ref.current = data_table
 
     # Container for the DataTable to allow horizontal scrolling if needed
     table_container = ft.Row(
         [data_table],
         scroll=ft.ScrollMode.ADAPTIVE, 
-        expand=True
+        # expand=True # Removed expand
     )
 
     return ft.Column(
         [
-            ft.Text("View Database Content", theme_style=ft.TextThemeStyle.HEADLINE_MEDIUM),
-            ft.Row([search_field, ft.ElevatedButton("Search", icon="search", on_click=perform_search)], alignment=ft.MainAxisAlignment.START),
-            ft.Divider(),
-            table_container, # Add the scrollable container for the table
-            pagination_row # Add pagination controls here
+            ft.Column( # Inner column for content, this will be centered by the outer column
+                [
+                    ft.Text("View Database Content", theme_style=ft.TextThemeStyle.HEADLINE_MEDIUM),
+                    ft.Row([search_field, ft.ElevatedButton("Search", icon="search", on_click=lambda e: perform_search(e, is_new_search=True))], alignment=ft.MainAxisAlignment.CENTER), # Center search bar too
+                    ft.Divider(),
+                    table_container, 
+                    pagination_row 
+                ],
+                spacing=10, 
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER # Changed from STRETCH to CENTER
+            )
         ],
-        expand=True, spacing=10, 
-        horizontal_alignment=ft.CrossAxisAlignment.STRETCH # Ensure column stretches
+        expand=True, 
+        horizontal_alignment=ft.CrossAxisAlignment.CENTER, 
     )
 
 def build_run_ai_analysis_view(page: ft.Page):
@@ -862,6 +1326,40 @@ def build_settings_view(page: ft.Page):
         spacing=10
     )
 
+# --- Save and Load Last Opened Database ---
+def save_last_opened_db(db_path: Path):
+    if APP_DATA_DIR.exists(): # Should always exist due to earlier mkdir
+        with open(LAST_OPENED_DB_FILE, "w") as f:
+            f.write(str(db_path.resolve()))
+
+def load_last_opened_db() -> Optional[Path]:
+    if LAST_OPENED_DB_FILE.exists():
+        try:
+            with open(LAST_OPENED_DB_FILE, "r") as f:
+                path_str = f.read().strip()
+            
+            if path_str:
+                db_path = Path(path_str)
+                if db_path.exists() and db_path.is_file(): # Verify it still exists
+                    return db_path
+                else:
+                    # If path is invalid or file doesn't exist, try to clear it
+                    print(f"INFO: Last opened DB path '{path_str}' is invalid or file missing. Attempting to remove {LAST_OPENED_DB_FILE}")
+                    try:
+                        LAST_OPENED_DB_FILE.unlink(missing_ok=True)
+                        print(f"INFO: Successfully removed {LAST_OPENED_DB_FILE}.")
+                    except PermissionError as e:
+                        print(f"WARNING: Could not remove {LAST_OPENED_DB_FILE} due to PermissionError: {e}. The app will continue.")
+                    except Exception as e_unlink: # Catch other potential errors during unlink
+                        print(f"WARNING: Error removing {LAST_OPENED_DB_FILE}: {e_unlink}. The app will continue.")
+        except Exception as e_read: # Catch errors during reading the file itself
+            print(f"WARNING: Error reading {LAST_OPENED_DB_FILE}: {e_read}. Attempting to remove the problematic file.")
+            try:
+                LAST_OPENED_DB_FILE.unlink(missing_ok=True)
+            except Exception as e_unlink_on_read_error:
+                print(f"WARNING: Could not remove problematic {LAST_OPENED_DB_FILE} after read error: {e_unlink_on_read_error}")
+    return None
+
 # --- Main Application ---
 def main(page: ft.Page):
     page.title = APP_NAME
@@ -874,74 +1372,103 @@ def main(page: ft.Page):
 
     page.appbar = None 
 
+    # --- Scrollbar Theming (Attempt) ---
+    # Removing scrollbar theming as ScrollbarThemeData is not available in older Flet versions
+    # page.theme = ft.Theme(
+    #     scrollbar_theme=ft.ScrollbarThemeData(
+    #         thumb_visibility=False, 
+    #         thickness=5,          
+    #         radius=5,
+    #         thumb_color={ft.MaterialState.HOVERED: ft.colors.with_opacity(0.5, ft.colors.WHITE70), 
+    #                      ft.MaterialState.DEFAULT: ft.colors.with_opacity(0.2, ft.colors.WHITE30)},
+    #         interactive=True 
+    #     )
+    # )
+    # page.dark_theme = ft.Theme(
+    #     scrollbar_theme=ft.ScrollbarThemeData(
+    #         thumb_visibility=False, 
+    #         thickness=5,          
+    #         radius=5,
+    #         thumb_color={ft.MaterialState.HOVERED: ft.colors.with_opacity(0.5, ft.colors.WHITE70), 
+    #                      ft.MaterialState.DEFAULT: ft.colors.with_opacity(0.2, ft.colors.WHITE30)},
+    #         interactive=True 
+    #     )
+    # ) 
+
     # Database Display Chip - will be positioned in a Stack later
     db_display_chip = ft.Chip(
         ref=active_db_chip_ref,
         label=ft.Text(""), # Use an empty Text control instead of None
-        # leading content set by update_active_db_display
-        visible=True, # Chip is always visible
-        # tooltip set by update_active_db_display
+        visible=True, 
+        on_click=lambda e: page.switch_view_callback(2) if hasattr(page, 'switch_view_callback') else None # Index 2 is Change DB view builder
     )
 
     # Navigation Rail (Sidebar)
     nav_rail = ft.NavigationRail(
         selected_index=0,
         label_type=ft.NavigationRailLabelType.ALL,
-        min_width=100, # Collapsed width
-        min_extended_width=250, # Extended width (if we enable extension)
+        min_width=100, 
+        min_extended_width=250, 
         group_alignment=-0.9, 
         destinations=[
             ft.NavigationRailDestination(icon="home_outlined", selected_icon="home", label="Home"),
             ft.NavigationRailDestination(icon="create_new_folder_outlined", selected_icon="create_new_folder", label="New DB"),
-            ft.NavigationRailDestination(icon="swap_horiz_outlined", selected_icon="swap_horiz", label="Change DB"),
-            ft.NavigationRailDestination(icon="table_chart_outlined", selected_icon="table_chart", label="View DB"),
-            ft.NavigationRailDestination(icon="model_training_outlined", selected_icon="model_training", label="AI Analysis"),
-            ft.NavigationRailDestination(icon="settings_outlined", selected_icon="settings", label="Settings"),
+            # Change DB (index 2 in view_builders) is now accessed via chip
+            ft.NavigationRailDestination(icon="table_chart_outlined", selected_icon="table_chart", label="View DB"),     # NavRail idx 2
+            ft.NavigationRailDestination(icon="model_training_outlined", selected_icon="model_training", label="AI Analysis"), # NavRail idx 3
+            ft.NavigationRailDestination(icon="settings_outlined", selected_icon="settings", label="Settings"),               # NavRail idx 4
         ],
-        trailing=None # Removed chip from here
+        trailing=None 
     )
 
     # Main content area (center part of the page)
     main_content_column = ft.Column(ref=main_content_area_ref, expand=True, spacing=20, scroll=ft.ScrollMode.ADAPTIVE)
 
-    # --- View Switching Logic (remains the same) ---
+    # Mapping from NavRail index to view_builders key
+    nav_to_builder_map = {
+        0: 0, # Home
+        1: 1, # New DB
+        2: 3, # View DB (was 3, now NavRail index 2)
+        3: 4, # AI Analysis (was 4, now NavRail index 3)
+        4: 5, # Settings (was 5, now NavRail index 4)
+    }
+    
+    # View builders dictionary (index 2 is Change DB, accessed by chip)
     view_builders = {
         0: build_home_view,
         1: build_create_new_db_view,
-        2: build_change_database_view,
+        2: build_change_database_view, 
         3: build_view_database_view,
         4: build_run_ai_analysis_view,
         5: build_settings_view,
     }
 
-    def switch_view(selected_idx: int, current_page: ft.Page):
+    def switch_view(selected_builder_idx: int, current_page: ft.Page):
         main_content_column.controls.clear()
-        builder = view_builders.get(selected_idx)
+        builder = view_builders.get(selected_builder_idx)
         if builder:
-            view_content = builder(current_page) # Get the content first
+            view_content = builder(current_page) 
             main_content_column.controls.append(view_content)
         else:
-            main_content_column.controls.append(ft.Text(f"View {selected_idx} not found."))
-        main_content_column.update() # Update the page with the new view structure
+            main_content_column.controls.append(ft.Text(f"View builder for index {selected_builder_idx} not found."))
+        main_content_column.update() 
 
-        # After adding the view, check if it has a specific refresh/load function to call
-        # This was previously only for index 2, now generalized.
-        if hasattr(current_page, 'view_refresh_triggers') and selected_idx in current_page.view_refresh_triggers:
-            refresh_func = current_page.view_refresh_triggers[selected_idx]
+        # Refresh trigger logic (based on builder_idx, which is what refresh_triggers are keyed by)
+        if hasattr(current_page, 'view_refresh_triggers') and selected_builder_idx in current_page.view_refresh_triggers:
+            refresh_func = current_page.view_refresh_triggers[selected_builder_idx]
             if callable(refresh_func):
-                print(f"DEBUG: Calling stored refresh/load function for view index {selected_idx}: {refresh_func}")
+                print(f"DEBUG: Calling stored refresh/load function for view builder index {selected_builder_idx}: {refresh_func}")
                 refresh_func()
             else:
-                print(f"DEBUG: Stored refresh_func for view index {selected_idx} is not callable.")
-        # else: # Optional: if you want to log when no trigger is found for a view
-            # print(f"DEBUG: No refresh trigger found on page for view index {selected_idx}.")
+                print(f"DEBUG: Stored refresh_func for view builder index {selected_builder_idx} is not callable.")
 
-    page.switch_view_callback = lambda idx: switch_view(idx, page)
-    page.global_switch_view_callback = switch_view
-    nav_rail.on_change = lambda e: switch_view(e.control.selected_index, page)
+    # Callback for chip (calls switch_view with builder index 2 for Change DB)
+    page.switch_view_callback = lambda builder_idx: switch_view(builder_idx, page)
     
-    # Main layout structure: Row [NavRail, MainContent]
-    # This will be wrapped in a Stack to position the chip
+    # NavRail on_change now uses the mapping
+    nav_rail.on_change = lambda e: switch_view(nav_to_builder_map.get(e.control.selected_index, 0), page) # Default to Home (builder idx 0)
+    
+    # Define main_layout_row before using it in ft.Stack
     main_layout_row = ft.Row(
         [
             nav_rail,
@@ -949,21 +1476,22 @@ def main(page: ft.Page):
             ft.Container( 
                 content=main_content_column,
                 expand=True,
-                padding=ft.padding.all(15), 
+                padding=ft.padding.only(left=15, right=15, bottom=15, top=55), # Added top padding to avoid chip
             )
         ],
         expand=True,
         vertical_alignment=ft.CrossAxisAlignment.START 
     )
-    
+
     page.add(
         ft.Stack(
             [
                 main_layout_row, # Base layer
                 ft.Container( # Container for the chip
                     content=db_display_chip,
-                    right=10,
-                    bottom=10,
+                    right=10, # Position top-right
+                    top=10,
+                    # bottom=10, # Remove bottom positioning
                     padding=ft.padding.all(5), # Optional: for some spacing around the chip
                     # bgcolor=ft.colors.with_opacity(0.8, ft.colors.SURFACE_VARIANT), # Optional: slight background
                     # border_radius=15 # Optional: rounded corners for the container
@@ -973,8 +1501,24 @@ def main(page: ft.Page):
         )
     )
 
-    switch_view(0, page) 
-    update_active_db_display(None) # Initialize chip display for "no DB" state
+    # Attempt to load and open the last used database
+    last_db = load_last_opened_db()
+    if last_db:
+        open_database(str(last_db), page) 
+        # After opening, directly go to home view, as the wizard is for new DBs
+        if hasattr(page, 'switch_view_callback'):
+             page.switch_view_callback(0) # Go to home
+        else: # Fallback if callback not set yet
+            switch_view(0, page)
+    else:
+        update_active_db_display(None) 
+        switch_view(0, page) # Start at home page if no last DB
+
+    # Initial view should be home, not the result of last_db logic if it changes view.
+    # The switch_view(0, page) at the end of main or after last_db handling ensures this.
+    # If last_db opens a DB and we want to stay on home, ensure switch_view(0, page) is called last.
+    # The current logic seems okay: open_database updates display but doesn't switch view.
+    # switch_view(0, page) is called if no last_db, or explicitly by last_db logic.
 
 if __name__ == "__main__":
     ft.app(target=main) 
